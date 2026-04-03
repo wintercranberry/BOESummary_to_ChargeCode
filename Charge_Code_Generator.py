@@ -36,6 +36,7 @@ import threading
 import traceback
 import json
 import csv
+import os
 import pandas as pd
 from tkinter import Tk, StringVar, BooleanVar, END, Toplevel, Canvas  # <-- Canvas imported here
 from tkinter import filedialog, messagebox
@@ -587,6 +588,11 @@ class ChargeCodesGUI:
         self.root = root
         self.root.title("Charge Code Generator (BOE Summary → Hierarchy) Version 2.0.0")
 
+        # Config file path
+        appdata = os.environ.get('APPDATA', str(pathlib.Path.home()))
+        self.config_dir = pathlib.Path(appdata) / 'ChargeCodeGenerator'
+        self.config_path = self.config_dir / 'config.json'
+
         # Vars
         self.input_path = StringVar()
         self.project_number = StringVar()
@@ -795,6 +801,9 @@ class ChargeCodesGUI:
         self._seed_wbs_desc_defaults()
         self._refresh_mapping_tree("wbs_desc")
 
+        # Load user preferences
+        self.load_config()
+
         wbs_desc_btns = ttk.Frame(wbs_desc_frame)
         wbs_desc_btns.grid(row=3, column=0, sticky="w", **pad)
         ttk.Button(wbs_desc_btns, text="Add", command=self.add_wbs_desc).pack(side="left", padx=4)
@@ -807,6 +816,10 @@ class ChargeCodesGUI:
         # Row 9: Run button
         self.btn_run = ttk.Button(frm, text="Run", command=self.run_clicked)
         self.btn_run.grid(row=9, column=1, sticky="w", **pad)
+        self.btn_save = ttk.Button(frm, text="Save Preferences", command=self.save_preferences)
+        self.btn_save.grid(row=9, column=2, **pad)
+        self.btn_reset = ttk.Button(frm, text="Reset to Defaults", command=self.reset_to_defaults)
+        self.btn_reset.grid(row=9, column=3, **pad)
 
         # Row 10: Status
         ttk.Label(frm, text="Status:").grid(row=10, column=0, sticky="nw", **pad)
@@ -1579,6 +1592,87 @@ class ChargeCodesGUI:
             messagebox.showerror("Error", f"An error occurred:\n\n{ex}\n\nSee status for details.")
         finally:
             self.btn_run.config(state="normal")
+
+    def load_config(self):
+        if not self.config_path.exists():
+            return
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            # Load mappings
+            if 'clin_data' in config:
+                self.clin_data = config['clin_data']
+            if 'phase_data' in config:
+                self.phase_data = config['phase_data']
+            if 'wbs_code_data' in config:
+                self.wbs_code_data = config['wbs_code_data']
+            if 'wbs_desc_data' in config:
+                self.wbs_desc_data = config['wbs_desc_data']
+            # Load toggles
+            if 'use_clin_map' in config:
+                self.use_clin_map.set(config['use_clin_map'])
+            if 'use_phase_map' in config:
+                self.use_phase_map.set(config['use_phase_map'])
+            if 'use_wbs_code_map' in config:
+                self.use_wbs_code_map.set(config['use_wbs_code_map'])
+            if 'use_wbs_desc_map' in config:
+                self.use_wbs_desc_map.set(config['use_wbs_desc_map'])
+            # Load contract options
+            if 'contract_options' in config:
+                self.contract_options = config['contract_options']
+                self.contract_combo['values'] = self.contract_options
+            # Refresh trees
+            self._refresh_mapping_tree("clin")
+            self._refresh_mapping_tree("phase")
+            self._refresh_mapping_tree("wbs_code")
+            self._refresh_mapping_tree("wbs_desc")
+        except Exception as ex:
+            messagebox.showerror("Config Load Error", f"Failed to load preferences:\n{ex}")
+
+    def save_preferences(self):
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            config = {
+                'clin_data': self.clin_data,
+                'phase_data': self.phase_data,
+                'wbs_code_data': self.wbs_code_data,
+                'wbs_desc_data': self.wbs_desc_data,
+                'use_clin_map': self.use_clin_map.get(),
+                'use_phase_map': self.use_phase_map.get(),
+                'use_wbs_code_map': self.use_wbs_code_map.get(),
+                'use_wbs_desc_map': self.use_wbs_desc_map.get(),
+                'contract_options': self.contract_options,
+            }
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+            messagebox.showinfo("Saved", "Preferences saved successfully.")
+        except Exception as ex:
+            messagebox.showerror("Save Error", f"Failed to save preferences:\n{ex}")
+
+    def reset_to_defaults(self):
+        if not messagebox.askyesno("Reset", "Reset all mappings and settings to defaults? This cannot be undone."):
+            return
+        # Reset mappings
+        self._seed_clin_defaults()
+        self._seed_phase_defaults()
+        self._seed_wbs_code_defaults()
+        self._seed_wbs_desc_defaults()
+        # Reset toggles
+        self.use_clin_map.set(True)
+        self.use_phase_map.set(True)
+        self.use_wbs_code_map.set(True)
+        self.use_wbs_desc_map.set(True)
+        # Reset contract options
+        self.contract_options = ["1: FFP", "2: CRNF"]
+        self.contract_combo['values'] = self.contract_options
+        if self.contract_options:
+            self.contract_combo.current(0)
+        # Refresh trees
+        self._refresh_mapping_tree("clin")
+        self._refresh_mapping_tree("phase")
+        self._refresh_mapping_tree("wbs_code")
+        self._refresh_mapping_tree("wbs_desc")
+        messagebox.showinfo("Reset", "Reset to defaults completed.")
 
 def main_gui():
     root = TkRootClass()
