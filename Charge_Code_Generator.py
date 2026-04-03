@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Charge Code Generator GUI (Tkinter)
-
 Features:
 - Input: Browse file or folder; optional drag & drop (via tkinterdnd2 if installed).
 - Level 1: Project Number (text).
@@ -9,16 +8,14 @@ Features:
 - CLIN & Phase mappings: tables with search bars, per-row checkboxes, Select All / Clear All, Import/Export.
   * Columns centered for readability.
 - Output: Choose either:
-    (A) Output Folder + File Name (default "Charge_Codes") with Drag & Drop, OR
-    (B) Single Output File Path (.xlsx) with Drag & Drop
+  (A) Output Folder + File Name (default "Charge_Codes") with Drag & Drop, OR
+  (B) Single Output File Path (.xlsx) with Drag & Drop
   We force .xlsx as the final extension.
 - Threaded run; status log; full error stacktraces.
-
 Dependencies:
 - Required: pandas, openpyxl
 - Optional (for drag & drop): tkinterdnd2
 """
-
 import re
 import pathlib
 import threading
@@ -44,7 +41,6 @@ except Exception:
 # --------------------------
 # Core logic
 # --------------------------
-
 def _find_column(df, keywords):
     """Locate a column whose name contains any keyword (case-insensitive)."""
     for c in df.columns:
@@ -63,8 +59,13 @@ def _extract_wbs_code(wbs_text):
         return None
     return m.group(1).replace(".", "")
 
-def _extract_clin(clin_text, clin_map=None, enable_map=True):
-    """From text like 'CLIN 0001' -> '0001'; applies optional CLIN mapping (e.g., to lot codes)."""
+def _extract_clin(clin_text, clin_map=None, enable_map=True, pad_to_6=False):
+    """
+    Extract CLIN from text like 'CLIN 0001' -> '0001'.
+    Optional behaviors:
+      - pad_to_6: if True, any CLIN shorter than 6 chars is left-padded with zeros to length 6.
+      - mapping: applies optional CLIN mapping (e.g., to lot codes).
+    """
     if clin_text is None:
         return None
     s = str(clin_text).strip()
@@ -73,6 +74,11 @@ def _extract_clin(clin_text, clin_map=None, enable_map=True):
         re.search(r"\b(\w+)\b", s).group(1).strip() if re.search(r"\b(\w+)\b", s) else s
     )
     code = code.strip()
+
+    # Optional: default-pad CLIN to 6 characters with leading zeros
+    if pad_to_6 and len(code) < 6:
+        code = code.rjust(6, '0')
+
     if enable_map and clin_map:
         return clin_map.get(code, code)
     return code
@@ -124,10 +130,10 @@ def read_boe_summary_multi(input_path):
         raise ValueError(f"Input path is neither a file nor folder: {p}")
 
 def build_paths(df, project_number, contract_type, clin_map=None, phase_map=None,
-                enable_clin_map=True, enable_phase_map=True):
+                enable_clin_map=True, enable_phase_map=True, pad_clin_to_6=False):
     """Build full paths (Level1..Level5) from the BOE Summary; sort & de-duplicate."""
-    clin_col  = _find_column(df, ["clin"])
-    wbs_col   = _find_column(df, ["wbs"])
+    clin_col = _find_column(df, ["clin"])
+    wbs_col = _find_column(df, ["wbs"])
     phase_col = _find_column(df, ["phase"])
     missing = [name for name, col in [("CLIN", clin_col), ("WBS", wbs_col), ("Phase", phase_col)] if col is None]
     if missing:
@@ -135,7 +141,12 @@ def build_paths(df, project_number, contract_type, clin_map=None, phase_map=None
 
     rows = []
     for _, r in df.iterrows():
-        level3 = _extract_clin(r.get(clin_col), clin_map=clin_map, enable_map=enable_clin_map)
+        level3 = _extract_clin(
+            r.get(clin_col),
+            clin_map=clin_map,
+            enable_map=enable_clin_map,
+            pad_to_6=pad_clin_to_6
+        )
         level4 = _extract_wbs_code(r.get(wbs_col))
         level5 = _normalize_phase(r.get(phase_col), phase_map=phase_map, enable_map=enable_phase_map)
         if not (level3 and level4 and level5):
@@ -202,7 +213,6 @@ def write_output_excel(df_out, output_path):
 # --------------------------
 # Tkinter GUI Implementation
 # --------------------------
-
 class MappingDialog(Toplevel):
     """Simple modal dialog to add/edit a mapping pair."""
     def __init__(self, parent, title, from_label="From", to_label="To", initial_from="", initial_to=""):
@@ -262,13 +272,13 @@ class ContractTypesEditor(Toplevel):
         frm.pack(fill="both", expand=True, **pad)
 
         ttk.Label(frm, text="Contract Types (Code / Label):").grid(row=0, column=0, sticky="w", **pad)
+
         self.tree = ttk.Treeview(frm, columns=("Code", "Label"), show="headings", height=10)
         self.tree.heading("Code", text="Code")
         self.tree.heading("Label", text="Label")
         self.tree.column("Code", width=100, anchor="center")
         self.tree.column("Label", width=220, anchor="center")
         self.tree.grid(row=1, column=0, sticky="nsew", **pad)
-
         yscroll = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=yscroll.set)
@@ -437,6 +447,8 @@ class ContractTypesEditor(Toplevel):
         self.destroy()
 
 class ChargeCodesGUI:
+    SPECIAL_CLIN_PAD_KEY = "__PAD_TO_6__"  # internal marker for the rule
+
     def __init__(self, root):
         self.root = root
         self.root.title("Charge Code Generator (BOE Summary → Hierarchy)")
@@ -460,7 +472,7 @@ class ChargeCodesGUI:
         self.use_phase_map = BooleanVar(value=True)
 
         # Mapping datasets with selection flags
-        self.clin_data = []   # list of dicts: {'selected':bool,'from':str,'to':str}
+        self.clin_data = []  # list of dicts: {'selected':bool,'from':str,'to':str}
         self.phase_data = []  # same structure
 
         # Search vars
@@ -468,7 +480,6 @@ class ChargeCodesGUI:
         self.phase_search = StringVar()
 
         pad = {"padx": 8, "pady": 6}
-
         frm = ttk.Frame(root)
         frm.pack(fill="both", expand=True, **pad)
 
@@ -501,12 +512,20 @@ class ChargeCodesGUI:
             self.contract_combo.current(0)
         ttk.Button(frm, text="Edit…", command=self.edit_contract_types).grid(row=3, column=2, **pad)
 
-        # Row 4: Output mode controls
+        # Row 4: Output mode controls (radio buttons side-by-side)
         ttk.Label(frm, text="Output Mode:").grid(row=4, column=0, sticky="w", **pad)
-        rb_folder = ttk.Radiobutton(frm, text="Folder + File Name", variable=self.output_mode, value="folder", command=self._on_output_mode_change)
-        rb_file   = ttk.Radiobutton(frm, text="Single File Path",    variable=self.output_mode, value="file",   command=self._on_output_mode_change)
-        rb_folder.grid(row=4, column=1, sticky="w", **pad)
-        rb_file.grid(row=4, column=2, sticky="w", **pad)
+        output_mode_frame = ttk.Frame(frm)
+        output_mode_frame.grid(row=4, column=1, sticky="w", **pad)
+        rb_folder = ttk.Radiobutton(
+            output_mode_frame, text="Folder + File Name", variable=self.output_mode, value="folder",
+            command=self._on_output_mode_change
+        )
+        rb_file = ttk.Radiobutton(
+            output_mode_frame, text="Single File Path", variable=self.output_mode, value="file",
+            command=self._on_output_mode_change
+        )
+        rb_folder.pack(side="left", padx=(0, 8))
+        rb_file.pack(side="left")
 
         # Row 5-6: Folder + File Name (default mode)
         self.row_output_folder_label = ttk.Label(frm, text="Output Folder:")
@@ -515,7 +534,6 @@ class ChargeCodesGUI:
         self.row_output_folder_entry.grid(row=5, column=1, sticky="ew", **pad)
         self.row_output_folder_browse = ttk.Button(frm, text="Browse…", command=self.browse_output_dir)
         self.row_output_folder_browse.grid(row=5, column=2, **pad)
-        # DnD for Output Folder
         if DND_AVAILABLE:
             try:
                 self.row_output_folder_entry.drop_target_register(DND_FILES)
@@ -533,7 +551,6 @@ class ChargeCodesGUI:
         self.row_output_file_label = ttk.Label(frm, text="Output File (.xlsx):")
         self.row_output_file_entry = ttk.Entry(frm, textvariable=self.output_file_path, width=60)
         self.row_output_file_browse = ttk.Button(frm, text="Browse…", command=self.browse_output_file)
-        # DnD for Output File Path
         if DND_AVAILABLE:
             try:
                 self.row_output_file_entry.drop_target_register(DND_FILES)
@@ -677,14 +694,12 @@ class ChargeCodesGUI:
         if not paths:
             return
         p = pathlib.Path(paths[0])
-
         if p.is_dir():
             # If a folder is dropped, construct a file path using current filename (or default)
             fname = self._sanitize_filename(self.output_filename.get().strip() or "Charge_Codes")
             fp = (p / fname).with_suffix(".xlsx")
             self.output_file_path.set(str(fp))
             return
-
         # If a file is dropped, enforce .xlsx
         if p.suffix.lower() != ".xlsx":
             p = p.with_suffix(".xlsx")
@@ -739,7 +754,6 @@ class ChargeCodesGUI:
             self.row_output_file_label.grid(row=7, column=0, sticky="w", padx=8, pady=6)
             self.row_output_file_entry.grid(row=7, column=1, sticky="ew", padx=8, pady=6)
             self.row_output_file_browse.grid(row=7, column=2, padx=8, pady=6)
-            # (Re)register DnD if needed (already registered in __init__, safe to repeat)
             if DND_AVAILABLE:
                 try:
                     self.row_output_file_entry.drop_target_register(DND_FILES)
@@ -763,24 +777,31 @@ class ChargeCodesGUI:
 
     # ---------- Mapping data management ----------
     def _seed_clin_defaults(self):
-        # Edit CLIN defaults here (or leave empty to let users import/edit)
+        """
+        Seed CLIN defaults, including a special rule entry that users can toggle:
+          - SPECIAL_CLIN_PAD_KEY: when selected, enables left-padding CLIN to 6 chars.
+        """
         self.clin_data = [
-            # {"selected": True,  "from": "0001", "to": "5031AA"},
-            # {"selected": True,  "from": "0002", "to": "5031AB"},
+            # Regular sample mappings could go here...
+            # {"selected": True, "from": "0001", "to": "5031AA"},
+            # {"selected": True, "from": "0002", "to": "5031AB"},
+
+            # Special rule row (off by default; user can toggle in UI)
+            {"selected": False, "from": self.SPECIAL_CLIN_PAD_KEY, "to": "Add chars until 6 chars"},
         ]
 
     def _seed_phase_defaults(self):
         # Edit Phase defaults here
         self.phase_data = [
-            {"selected": True, "from": "BID",  "to": "1BID"},
-            {"selected": True, "from": "LOE",  "to": "ZLOE"},
-            {"selected": True, "from": "RAV",  "to": "ZRAV"},
-            {"selected": True, "from": "PDV",  "to": "ZPDR"},
-            {"selected": True, "from": "DDV",  "to": "ZCDR"},
-            {"selected": True, "from": "COD",  "to": "ZCOD"},
-            {"selected": True, "from": "HSI",  "to": "ZHSI"},
-            {"selected": True, "from": "CVT",  "to": "ZCVT"},
-            {"selected": True, "from": "GAT",  "to": "ZGAT"},
+            {"selected": True, "from": "BID", "to": "1BID"},
+            {"selected": True, "from": "LOE", "to": "ZLOE"},
+            {"selected": True, "from": "RAV", "to": "ZRAV"},
+            {"selected": True, "from": "PDV", "to": "ZPDR"},
+            {"selected": True, "from": "DDV", "to": "ZCDR"},
+            {"selected": True, "from": "COD", "to": "ZCOD"},
+            {"selected": True, "from": "HSI", "to": "ZHSI"},
+            {"selected": True, "from": "CVT", "to": "ZCVT"},
+            {"selected": True, "from": "GAT", "to": "ZGAT"},
             {"selected": True, "from": "PROD", "to": "ZPROD"},
         ]
 
@@ -806,12 +827,21 @@ class ChargeCodesGUI:
 
         for iid in tree.get_children():
             tree.delete(iid)
-
         tree._row_refs = {}
         for row in data:
             mark = "☑" if row["selected"] else "☐"
-            from_display = row["from"].upper() if which == "phase" else row["from"]
-            iid = tree.insert("", END, values=(mark, from_display, row["to"]))
+            if which == "phase":
+                from_display = row["from"].upper()
+                to_display = row["to"]
+            else:
+                # Friendly display for the special CLIN padding rule
+                if row["from"] == self.SPECIAL_CLIN_PAD_KEY:
+                    from_display = "CLIN w/less than 6 characters"
+                    to_display = row["to"]
+                else:
+                    from_display = row["from"]
+                    to_display = row["to"]
+            iid = tree.insert("", END, values=(mark, from_display, to_display))
             tree._row_refs[iid] = row
 
     def _on_tree_click(self, event, which):
@@ -843,6 +873,10 @@ class ChargeCodesGUI:
             if not k or not v:
                 messagebox.showerror("Validation", "Both 'From' and 'To' are required.")
                 return
+            # Prevent duplicate of the special rule key
+            if k == self.SPECIAL_CLIN_PAD_KEY:
+                messagebox.showerror("Validation", "The special rule key is reserved by the system.")
+                return
             for row in self.clin_data:
                 if row["from"] == k:
                     row["to"] = v
@@ -858,7 +892,9 @@ class ChargeCodesGUI:
             messagebox.showinfo("Delete", "Select one or more rows in the CLIN mapping to delete.")
             return
         refs = self.clin_tree._row_refs
-        self.clin_data = [r for r in self.clin_data if r not in [refs[iid] for iid in sel]]
+        # Do not delete the special rule row via UI
+        to_remove = [refs[iid] for iid in sel if refs.get(iid) and refs[iid]["from"] != self.SPECIAL_CLIN_PAD_KEY]
+        self.clin_data = [r for r in self.clin_data if r not in to_remove]
         self._refresh_mapping_tree("clin")
 
     def add_phase(self):
@@ -893,6 +929,9 @@ class ChargeCodesGUI:
         for iid in tree.get_children():
             row = tree._row_refs.get(iid)
             if row:
+                # Don't auto-select the special rule with Select All; keep it explicit
+                if which == "clin" and row["from"] == self.SPECIAL_CLIN_PAD_KEY:
+                    continue
                 row["selected"] = True
                 vals = list(tree.item(iid, "values"))
                 vals[0] = "☑"
@@ -934,18 +973,55 @@ class ChargeCodesGUI:
                     if len(row) < 2:
                         continue
                     items.append((row[0].strip(), row[1].strip()))
+
             target = self.clin_data if which == "clin" else self.phase_data
-            for k, v in items:
-                k_use = k if which == "clin" else k.upper()
-                found = False
+
+            if which == "clin":
+                # Preserve the special rule row; update/merge the rest
+                special_row = None
                 for r in target:
-                    if (r["from"] == k_use) or (which == "phase" and r["from"].upper() == k_use):
-                        r["to"] = v
-                        r["selected"] = True
-                        found = True
+                    if r["from"] == self.SPECIAL_CLIN_PAD_KEY:
+                        special_row = r
                         break
-                if not found:
-                    target.append({"selected": True, "from": k_use, "to": v})
+                # Rebuild target with special row retained
+                new_target = [special_row] if special_row else []
+                # Merge imported items
+                for k, v in items:
+                    if k == self.SPECIAL_CLIN_PAD_KEY:
+                        # Allow setting its 'selected' via 'to' value hint: "on"/"off"
+                        if isinstance(v, str) and v.strip().lower() in ("on", "true", "yes", "1"):
+                            if special_row:
+                                special_row["selected"] = True
+                        elif isinstance(v, str) and v.strip().lower() in ("off", "false", "no", "0"):
+                            if special_row:
+                                special_row["selected"] = False
+                        continue
+                    # Add/replace normal mappings
+                    found = False
+                    for r in new_target:
+                        if r and r["from"] == k:
+                            r["to"] = v
+                            r["selected"] = True
+                            found = True
+                            break
+                    if not found:
+                        new_target.append({"selected": True, "from": k, "to": v})
+                # Assign back
+                self.clin_data = [r for r in new_target if r]
+            else:
+                # Phase: normal merge behavior
+                for k, v in items:
+                    k_use = k.upper()
+                    found = False
+                    for r in target:
+                        if r["from"].upper() == k_use:
+                            r["to"] = v
+                            r["selected"] = True
+                            found = True
+                            break
+                    if not found:
+                        target.append({"selected": True, "from": k_use, "to": v})
+
             self._refresh_mapping_tree(which)
             messagebox.showinfo("Import", f"Imported {which} mappings from:\n{path}")
         except Exception as ex:
@@ -963,18 +1039,51 @@ class ChargeCodesGUI:
         target = self.clin_data if which == "clin" else self.phase_data
         try:
             if p.suffix.lower() == ".json":
-                obj = { (r["from"].upper() if which == "phase" else r["from"]) : r["to"] for r in target }
-                with open(p, "w", encoding="utf-8") as f:
-                    json.dump(obj, f, indent=2)
+                if which == "clin":
+                    obj = {}
+                    for r in target:
+                        key = r["from"]
+                        # For the special rule, export "on"/"off" flag in the 'to' field
+                        val = ("on" if (r["from"] == self.SPECIAL_CLIN_PAD_KEY and r["selected"]) else r["to"])
+                        obj[key] = val
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, indent=2)
+                else:
+                    obj = {r["from"].upper(): r["to"] for r in target}
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, indent=2)
             else:
                 with open(p, "w", encoding="utf-8", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow(["From", "To"])
                     for r in target:
-                        writer.writerow([(r["from"].upper() if which == "phase" else r["from"]), r["to"]])
+                        key = (r["from"].upper() if which == "phase" else r["from"])
+                        val = ("on" if (which == "clin" and r["from"] == self.SPECIAL_CLIN_PAD_KEY and r["selected"]) else r["to"])
+                        writer.writerow([key, val])
             messagebox.showinfo("Export", f"Exported {which} mappings to:\n{path}")
         except Exception as ex:
             messagebox.showerror("Export Error", f"Failed to export:\n{ex}")
+
+    # ---------- Helpers to read flags & dicts ----------
+    def _clin_pad_enabled(self) -> bool:
+        """Return True if the special CLIN padding rule is selected."""
+        for r in self.clin_data:
+            if r["from"] == self.SPECIAL_CLIN_PAD_KEY and r["selected"]:
+                return True
+        return False
+
+    def _build_mapping_dict(self, which):
+        """Build mapping dict using ONLY rows with selected=True (phase keys uppercased)."""
+        src = self.clin_data if which == "clin" else self.phase_data
+        d = {}
+        for r in src:
+            if r["selected"]:
+                # Skip special rule rows when building dict
+                if which == "clin" and r["from"] == self.SPECIAL_CLIN_PAD_KEY:
+                    continue
+                key = r["from"].upper() if which == "phase" else r["from"]
+                d[key] = r["to"]
+        return d
 
     # ---------- IO helpers ----------
     def log(self, msg):
@@ -1019,7 +1128,7 @@ class ChargeCodesGUI:
             self.output_file_path.set(str(p))
 
     def _sanitize_filename(self, name: str) -> str:
-        sanitized = re.sub(r'[<>:"/\\|?*]+', "_", name).strip()
+        sanitized = re.sub(r'[\<>:"/\\\|\?\*]+', "_", name).strip()
         return sanitized or "Charge_Codes"
 
     def _final_output_path(self) -> pathlib.Path:
@@ -1040,16 +1149,6 @@ class ChargeCodesGUI:
             if fp.suffix.lower() != ".xlsx":
                 fp = fp.with_suffix(".xlsx")
             return fp
-
-    def _build_mapping_dict(self, which):
-        """Build mapping dict using ONLY rows with selected=True (phase keys uppercased)."""
-        src = self.clin_data if which == "clin" else self.phase_data
-        d = {}
-        for r in src:
-            if r["selected"]:
-                key = r["from"].upper() if which == "phase" else r["from"]
-                d[key] = r["to"]
-        return d
 
     def validate(self):
         errs = []
@@ -1126,6 +1225,7 @@ class ChargeCodesGUI:
             proj = self.project_number.get().strip()
             selected = self.contract_type.get().strip()
             ctype = self._parse_contract_code(selected) or "1"
+
             final_out_path = self._final_output_path()
 
             # Build mapping dicts from selected rows only
@@ -1133,6 +1233,9 @@ class ChargeCodesGUI:
             phase_map = self._build_mapping_dict("phase")
             enable_clin = bool(self.use_clin_map.get())
             enable_phase = bool(self.use_phase_map.get())
+
+            # Rule flag from CLIN mapping UI
+            pad_clin_to_6 = self._clin_pad_enabled()
 
             self.log(f"Loading input from: {in_path}")
             df_boe = read_boe_summary_multi(in_path)
@@ -1146,6 +1249,7 @@ class ChargeCodesGUI:
                 phase_map=phase_map,
                 enable_clin_map=enable_clin,
                 enable_phase_map=enable_phase,
+                pad_clin_to_6=pad_clin_to_6,
             )
 
             self.log("Expanding hierarchy…")
@@ -1158,6 +1262,7 @@ class ChargeCodesGUI:
             self.log(f"✅ Done. Rows written (hierarchical): {len(df_out)}")
             self.log(f"📄 Output: {final_out}")
             messagebox.showinfo("Success", f"Wrote Excel:\n{final_out}\n\nRows: {len(df_out)}")
+
         except Exception as ex:
             err_text = "".join(traceback.format_exception(type(ex), ex, ex.__traceback__))
             self.log("❌ Error occurred:\n" + err_text)
@@ -1175,7 +1280,6 @@ def main_gui():
             style.theme_use("clam")
     except Exception:
         pass
-
     app = ChargeCodesGUI(root)
     root.geometry("1180x800")
     root.mainloop()
