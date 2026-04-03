@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
 Charge Code Generator GUI (Tkinter)
+
 Features:
 - Input: Browse file or folder; optional drag & drop (via tkinterdnd2 if installed).
 - Level 1: Project Number (text).
 - Level 2: Contract Type (dropdown; e.g., "1: FFP", "2: CRNF") + editor dialog.
-- CLIN & Phase mappings: tables with search bars, per-row checkboxes, Select All / Clear All, Import/Export.
-  * Columns centered for readability.
+- Mapping windows (with search, per-row checkboxes, Select All / Clear All, Import/Export):
+  • CLIN (with special 'pad to 6' rule)
+  • Phase (case-insensitive keys, uppercased)
+  • WBS Code (maps numeric 6-char code extracted from WBS text)
+  • WBS Description (case-insensitive keys, uppercased)
+  (All mapping trees support vertical AND horizontal scrolling.)
+- Main window: Vertical scroll wheel support via ScrollableFrame (Canvas + scrollbar).
 - Output: Choose either:
   (A) Output Folder + File Name (default "Charge_Codes") with Drag & Drop, OR
   (B) Single Output File Path (.xlsx) with Drag & Drop
   We force .xlsx as the final extension.
 - Threaded run; status log; full error stacktraces.
+
 Dependencies:
 - Required: pandas, openpyxl
 - Optional (for drag & drop): tkinterdnd2
+
+Version 2.0.0
+
+Implemented mapping for wbs and wbs description and added scroll wheels for each
+added scroll wheel for entire window
+added CLIN mapping regex
 """
+
 import re
 import pathlib
 import threading
@@ -23,7 +37,7 @@ import traceback
 import json
 import csv
 import pandas as pd
-from tkinter import Tk, StringVar, BooleanVar, END, Toplevel
+from tkinter import Tk, StringVar, BooleanVar, END, Toplevel, Canvas  # <-- Canvas imported here
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
@@ -41,6 +55,7 @@ except Exception:
 # --------------------------
 # Core logic
 # --------------------------
+
 def _find_column(df, keywords):
     """Locate a column whose name contains any keyword (case-insensitive)."""
     for c in df.columns:
@@ -59,12 +74,38 @@ def _extract_wbs_code(wbs_text):
         return None
     return m.group(1).replace(".", "")
 
+def _extract_wbs_desc(wbs_text):
+    """
+    From WBS text (e.g., '02.01.02 - System Architecture'), extract the description part:
+    • Looks for NN.NN.NN then takes what's after it, trimming leading separators (dash/en-dash/em-dash/colon).
+    • Returns None if no description is found.
+    """
+    if not isinstance(wbs_text, str):
+        return None
+    s = wbs_text.strip()
+    m = re.search(r"\b(\d{2}\.\d{2}\.\d{2})\b", s)
+    if not m:
+        return None
+    rest = s[m.end():].strip()
+    # remove a leading separator + spaces
+    rest = re.sub(r"^\s*[-–—:]\s*", "", rest)
+    return rest or None
+
+def _map_wbs_code(code, wbs_code_map=None, enable_map=True):
+    """Optionally map WBS code via user-defined mapping dict."""
+    if code is None:
+        return None
+    c = str(code).strip()
+    if enable_map and wbs_code_map:
+        return wbs_code_map.get(c, c)
+    return c
+
 def _extract_clin(clin_text, clin_map=None, enable_map=True, pad_to_6=False):
     """
     Extract CLIN from text like 'CLIN 0001' -> '0001'.
     Optional behaviors:
-      - pad_to_6: if True, any CLIN shorter than 6 chars is left-padded with zeros to length 6.
-      - mapping: applies optional CLIN mapping (e.g., to lot codes).
+    - pad_to_6: if True, any CLIN shorter than 6 chars is left-padded with zeros to length 6.
+    - mapping: applies optional CLIN mapping (e.g., to lot codes).
     """
     if clin_text is None:
         return None
@@ -74,17 +115,15 @@ def _extract_clin(clin_text, clin_map=None, enable_map=True, pad_to_6=False):
         re.search(r"\b(\w+)\b", s).group(1).strip() if re.search(r"\b(\w+)\b", s) else s
     )
     code = code.strip()
-
     # Optional: default-pad CLIN to 6 characters with leading zeros
     if pad_to_6 and len(code) < 6:
         code = code.rjust(6, '0')
-
     if enable_map and clin_map:
         return clin_map.get(code, code)
     return code
 
 def _normalize_phase(phase_text, phase_map=None, enable_map=True):
-    """Map phase text via user-defined phase_map; case-insensitive on keys."""
+    """Map phase text via user-defined phase_map; case-insensitive on keys (uppercased)."""
     if phase_text is None:
         return None
     p = str(phase_text).strip()
@@ -93,6 +132,17 @@ def _normalize_phase(phase_text, phase_map=None, enable_map=True):
         if mapped is not None:
             return mapped
     return p
+
+def _normalize_wbs_desc(desc_text, wbs_desc_map=None, enable_map=True):
+    """Map WBS description via user-defined mapping; case-insensitive on keys (uppercased)."""
+    if desc_text is None:
+        return None
+    d = str(desc_text).strip()
+    if enable_map and wbs_desc_map:
+        mapped = wbs_desc_map.get(d.upper())
+        if mapped is not None:
+            return mapped
+    return d
 
 def read_boe_summary_single(input_path):
     """Read first sheet as strings; tolerate .xlsm."""
@@ -129,9 +179,15 @@ def read_boe_summary_multi(input_path):
     else:
         raise ValueError(f"Input path is neither a file nor folder: {p}")
 
-def build_paths(df, project_number, contract_type, clin_map=None, phase_map=None,
-                enable_clin_map=True, enable_phase_map=True, pad_clin_to_6=False):
-    """Build full paths (Level1..Level5) from the BOE Summary; sort & de-duplicate."""
+def build_paths(
+    df, project_number, contract_type,
+    clin_map=None, phase_map=None,
+    wbs_code_map=None, wbs_desc_map=None,
+    enable_clin_map=True, enable_phase_map=True,
+    enable_wbs_code_map=True, enable_wbs_desc_map=True,
+    pad_clin_to_6=False,
+):
+    """Build full paths (Level1..Level5) from the BOE Summary; include WBS Description; sort & de-duplicate."""
     clin_col = _find_column(df, ["clin"])
     wbs_col = _find_column(df, ["wbs"])
     phase_col = _find_column(df, ["phase"])
@@ -147,13 +203,27 @@ def build_paths(df, project_number, contract_type, clin_map=None, phase_map=None
             enable_map=enable_clin_map,
             pad_to_6=pad_clin_to_6
         )
-        level4 = _extract_wbs_code(r.get(wbs_col))
+        raw_wbs_code = _extract_wbs_code(r.get(wbs_col))
+        level4 = _map_wbs_code(raw_wbs_code, wbs_code_map=wbs_code_map, enable_map=enable_wbs_code_map)
         level5 = _normalize_phase(r.get(phase_col), phase_map=phase_map, enable_map=enable_phase_map)
+
+        # WBS description parsed and optionally mapped
+        raw_desc = _extract_wbs_desc(r.get(wbs_col))
+        wbs_desc_final = _normalize_wbs_desc(raw_desc, wbs_desc_map=wbs_desc_map, enable_map=enable_wbs_desc_map)
+
         if not (level3 and level4 and level5):
             continue
+
         level1 = str(project_number).strip()
         level2 = str(contract_type).strip() if contract_type else "1"
-        rows.append({"Level 1": level1, "Level 2": level2, "Level 3": level3, "Level 4": level4, "Level 5": level5})
+        rows.append({
+            "Level 1": level1,
+            "Level 2": level2,
+            "Level 3": level3,
+            "Level 4": level4,
+            "Level 5": level5,
+            "WBS Description": wbs_desc_final or "",
+        })
 
     if not rows:
         raise ValueError("No valid rows found (CLIN/WBS/Phase missing).")
@@ -163,7 +233,10 @@ def build_paths(df, project_number, contract_type, clin_map=None, phase_map=None
     return paths
 
 def expand_hierarchy(paths):
-    """Expand sorted full paths into hierarchical rows with partial parent lines and full lines."""
+    """
+    Expand sorted full paths into hierarchical rows with partial parent lines and full lines.
+    Adds 'WBS Description' column (blank on partial rows, populated on full rows).
+    """
     out = []
     last = {"Level 1": None, "Level 2": None, "Level 3": None, "Level 4": None, "Level 5": None}
 
@@ -171,6 +244,7 @@ def expand_hierarchy(paths):
         vals = {lvl: paths_row[lvl] if lvl in levels_present else "" for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]}
         parts = [paths_row[lvl] for lvl in levels_present]
         vals["Charge String"] = ".".join(parts) + "."
+        vals["WBS Description"] = ""  # blank for partial rows
         return vals
 
     for _, paths_row in paths.iterrows():
@@ -196,6 +270,8 @@ def expand_hierarchy(paths):
 
         full_vals = {lvl: paths_row[lvl] for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]}
         full_vals["Charge String"] = ".".join([paths_row[lvl] for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]])
+        # Populate description on the FULL row
+        full_vals["WBS Description"] = paths_row.get("WBS Description", "")
         out.append(full_vals)
         last["Level 5"] = paths_row["Level 5"]
 
@@ -213,6 +289,7 @@ def write_output_excel(df_out, output_path):
 # --------------------------
 # Tkinter GUI Implementation
 # --------------------------
+
 class MappingDialog(Toplevel):
     """Simple modal dialog to add/edit a mapping pair."""
     def __init__(self, parent, title, from_label="From", to_label="To", initial_from="", initial_to=""):
@@ -272,23 +349,25 @@ class ContractTypesEditor(Toplevel):
         frm.pack(fill="both", expand=True, **pad)
 
         ttk.Label(frm, text="Contract Types (Code / Label):").grid(row=0, column=0, sticky="w", **pad)
-
         self.tree = ttk.Treeview(frm, columns=("Code", "Label"), show="headings", height=10)
         self.tree.heading("Code", text="Code")
         self.tree.heading("Label", text="Label")
         self.tree.column("Code", width=100, anchor="center")
         self.tree.column("Label", width=220, anchor="center")
         self.tree.grid(row=1, column=0, sticky="nsew", **pad)
+
         yscroll = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=yscroll.set)
+        xscroll = ttk.Scrollbar(frm, orient="horizontal", command=self.tree.xview)
+        xscroll.grid(row=2, column=0, sticky="ew", **pad)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         for item in contract_items:
             code, label = self._split_item(item)
             self.tree.insert("", END, values=(code, label))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=2, column=0, sticky="w", **pad)
+        btns.grid(row=3, column=0, sticky="w", **pad)
         ttk.Button(btns, text="Add", command=self.add_item).pack(side="left", padx=4)
         ttk.Button(btns, text="Edit", command=self.edit_item).pack(side="left", padx=4)
         ttk.Button(btns, text="Delete", command=self.delete_item).pack(side="left", padx=4)
@@ -296,7 +375,7 @@ class ContractTypesEditor(Toplevel):
         ttk.Button(btns, text="Export…", command=self.export_items).pack(side="left", padx=4)
 
         action = ttk.Frame(frm)
-        action.grid(row=3, column=0, sticky="e", **pad)
+        action.grid(row=4, column=0, sticky="e", **pad)
         ttk.Button(action, text="Cancel", command=self._cancel).pack(side="right", padx=5)
         ttk.Button(action, text="OK", command=self._ok).pack(side="right", padx=5)
 
@@ -446,12 +525,67 @@ class ContractTypesEditor(Toplevel):
         self.result = None
         self.destroy()
 
+# ---------- ScrollableFrame for main window (vertical scroll) ----------
+class ScrollableFrame(ttk.Frame):
+    """
+    A reusable scrollable container: Canvas + vertical scrollbar with a child Frame.
+    Binds mouse wheel for Windows/macOS and Button-4/5 for Linux.
+    """
+    def __init__(self, parent, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+
+        # Use tk.Canvas (not ttk.Canvas)
+        self.canvas = Canvas(self, highlightthickness=0)
+        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vscroll.set)
+
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vscroll.grid(row=0, column=1, sticky="ns")
+
+        # The inner frame that holds actual content
+        self.frame = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.frame, anchor="nw")
+
+        # Configure expansion
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # Update scrollregion whenever the inner frame resizes
+        self.frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Mouse wheel bindings (Windows/macOS)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Mouse wheel bindings (Linux/X11)
+        self.canvas.bind_all("<Button-4>", lambda e: self._scroll_units(-3))
+        self.canvas.bind_all("<Button-5>", lambda e: self._scroll_units(+3))
+
+    def _on_frame_configure(self, event):
+        # Set scroll region to encompass the inner frame
+        self.canvas.configure(scrollregion=self.canvas.bbox(self._window))
+
+    def _on_canvas_configure(self, event):
+        # Make the inner frame the same width as the canvas so it fills horizontally
+        self.canvas.itemconfigure(self._window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        # On Windows, event.delta is multiples of 120; on macOS, may be small ints
+        delta = event.delta
+        if delta == 0:
+            return
+        step = -1 if delta > 0 else +1
+        # Multiply for a comfortable scroll speed
+        self._scroll_units(step * 3)
+
+    def _scroll_units(self, units):
+        self.canvas.yview_scroll(units, "units")
+
 class ChargeCodesGUI:
     SPECIAL_CLIN_PAD_KEY = "__PAD_TO_6__"  # internal marker for the rule
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Charge Code Generator (BOE Summary → Hierarchy)")
+        self.root.title("Charge Code Generator (BOE Summary → Hierarchy) Version 2.0.0")
 
         # Vars
         self.input_path = StringVar()
@@ -470,18 +604,30 @@ class ChargeCodesGUI:
         # Mapping toggles
         self.use_clin_map = BooleanVar(value=True)
         self.use_phase_map = BooleanVar(value=True)
+        self.use_wbs_code_map = BooleanVar(value=True)
+        self.use_wbs_desc_map = BooleanVar(value=True)
 
         # Mapping datasets with selection flags
-        self.clin_data = []  # list of dicts: {'selected':bool,'from':str,'to':str}
-        self.phase_data = []  # same structure
+        self.clin_data = []        # list of dicts: {'selected':bool,'from':str,'to':str}
+        self.phase_data = []       # same structure (keys uppercased on display)
+        self.wbs_code_data = []    # mapping for Level 4 (WBS code)
+        self.wbs_desc_data = []    # mapping for WBS Description (case-insensitive, use upper keys)
 
         # Search vars
         self.clin_search = StringVar()
         self.phase_search = StringVar()
+        self.wbs_code_search = StringVar()
+        self.wbs_desc_search = StringVar()
 
         pad = {"padx": 8, "pady": 6}
-        frm = ttk.Frame(root)
-        frm.pack(fill="both", expand=True, **pad)
+
+        # Use ScrollableFrame for the entire main content
+        scrollable = ScrollableFrame(root)
+        scrollable.grid(row=0, column=0, sticky="nsew")
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        frm = scrollable.frame  # place all widgets inside this frame
 
         # Row 0: Input (file or folder) with browse + optional drag & drop
         ttk.Label(frm, text="Input (Excel file or folder):").grid(row=0, column=0, sticky="w", **pad)
@@ -565,7 +711,6 @@ class ChargeCodesGUI:
         # ---- CLIN Mapping Editor ----
         clin_frame = ttk.LabelFrame(editors, text="CLIN (Contract) Mapping")
         clin_frame.grid(row=0, column=0, sticky="nsew", **pad)
-
         top_clin = ttk.Frame(clin_frame)
         top_clin.grid(row=0, column=0, sticky="ew", **pad)
         ttk.Checkbutton(top_clin, text="Apply CLIN mapping", variable=self.use_clin_map).pack(side="left")
@@ -578,7 +723,7 @@ class ChargeCodesGUI:
         self._refresh_mapping_tree("clin")
 
         clin_btns = ttk.Frame(clin_frame)
-        clin_btns.grid(row=2, column=0, sticky="w", **pad)
+        clin_btns.grid(row=3, column=0, sticky="w", **pad)
         ttk.Button(clin_btns, text="Add", command=self.add_clin).pack(side="left", padx=4)
         ttk.Button(clin_btns, text="Delete", command=self.delete_clin).pack(side="left", padx=4)
         ttk.Button(clin_btns, text="Select All", command=lambda: self.select_all("clin")).pack(side="left", padx=4)
@@ -589,7 +734,6 @@ class ChargeCodesGUI:
         # ---- Phase Mapping Editor ----
         phase_frame = ttk.LabelFrame(editors, text="Phase Mapping")
         phase_frame.grid(row=0, column=1, sticky="nsew", **pad)
-
         top_phase = ttk.Frame(phase_frame)
         top_phase.grid(row=0, column=0, sticky="ew", **pad)
         ttk.Checkbutton(top_phase, text="Apply Phase mapping", variable=self.use_phase_map).pack(side="left")
@@ -602,13 +746,63 @@ class ChargeCodesGUI:
         self._refresh_mapping_tree("phase")
 
         phase_btns = ttk.Frame(phase_frame)
-        phase_btns.grid(row=2, column=0, sticky="w", **pad)
+        phase_btns.grid(row=3, column=0, sticky="w", **pad)
         ttk.Button(phase_btns, text="Add", command=self.add_phase).pack(side="left", padx=4)
         ttk.Button(phase_btns, text="Delete", command=self.delete_phase).pack(side="left", padx=4)
         ttk.Button(phase_btns, text="Select All", command=lambda: self.select_all("phase")).pack(side="left", padx=4)
         ttk.Button(phase_btns, text="Clear All", command=lambda: self.clear_all("phase")).pack(side="left", padx=4)
         ttk.Button(phase_btns, text="Import…", command=lambda: self.import_mapping("phase")).pack(side="left", padx=4)
         ttk.Button(phase_btns, text="Export…", command=lambda: self.export_mapping("phase")).pack(side="left", padx=4)
+
+        # ---- WBS Code Mapping Editor ----
+        wbs_code_frame = ttk.LabelFrame(editors, text="WBS Code Mapping")
+        wbs_code_frame.grid(row=1, column=0, sticky="nsew", **pad)
+        top_wbs_code = ttk.Frame(wbs_code_frame)
+        top_wbs_code.grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Checkbutton(top_wbs_code, text="Apply WBS code mapping", variable=self.use_wbs_code_map).pack(side="left")
+        ttk.Label(top_wbs_code, text="Search:").pack(side="left", padx=(12, 4))
+        ent_wbs_code_search = ttk.Entry(top_wbs_code, textvariable=self.wbs_code_search, width=20)
+        ent_wbs_code_search.pack(side="left")
+
+        self.wbs_code_tree = self._create_selectable_mapping_tree(
+            wbs_code_frame, start_row=1, columns=("✓", "From (WBS Code)", "To (Mapped Code)")
+        )
+        self._seed_wbs_code_defaults()
+        self._refresh_mapping_tree("wbs_code")
+
+        wbs_code_btns = ttk.Frame(wbs_code_frame)
+        wbs_code_btns.grid(row=3, column=0, sticky="w", **pad)
+        ttk.Button(wbs_code_btns, text="Add", command=self.add_wbs_code).pack(side="left", padx=4)
+        ttk.Button(wbs_code_btns, text="Delete", command=self.delete_wbs_code).pack(side="left", padx=4)
+        ttk.Button(wbs_code_btns, text="Select All", command=lambda: self.select_all("wbs_code")).pack(side="left", padx=4)
+        ttk.Button(wbs_code_btns, text="Clear All", command=lambda: self.clear_all("wbs_code")).pack(side="left", padx=4)
+        ttk.Button(wbs_code_btns, text="Import…", command=lambda: self.import_mapping("wbs_code")).pack(side="left", padx=4)
+        ttk.Button(wbs_code_btns, text="Export…", command=lambda: self.export_mapping("wbs_code")).pack(side="left", padx=4)
+
+        # ---- WBS Description Mapping Editor ----
+        wbs_desc_frame = ttk.LabelFrame(editors, text="WBS Description Mapping")
+        wbs_desc_frame.grid(row=1, column=1, sticky="nsew", **pad)
+        top_wbs_desc = ttk.Frame(wbs_desc_frame)
+        top_wbs_desc.grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Checkbutton(top_wbs_desc, text="Apply WBS description mapping", variable=self.use_wbs_desc_map).pack(side="left")
+        ttk.Label(top_wbs_desc, text="Search:").pack(side="left", padx=(12, 4))
+        ent_wbs_desc_search = ttk.Entry(top_wbs_desc, textvariable=self.wbs_desc_search, width=20)
+        ent_wbs_desc_search.pack(side="left")
+
+        self.wbs_desc_tree = self._create_selectable_mapping_tree(
+            wbs_desc_frame, start_row=1, columns=("✓", "From (Upper)", "To (Mapped Description)")
+        )
+        self._seed_wbs_desc_defaults()
+        self._refresh_mapping_tree("wbs_desc")
+
+        wbs_desc_btns = ttk.Frame(wbs_desc_frame)
+        wbs_desc_btns.grid(row=3, column=0, sticky="w", **pad)
+        ttk.Button(wbs_desc_btns, text="Add", command=self.add_wbs_desc).pack(side="left", padx=4)
+        ttk.Button(wbs_desc_btns, text="Delete", command=self.delete_wbs_desc).pack(side="left", padx=4)
+        ttk.Button(wbs_desc_btns, text="Select All", command=lambda: self.select_all("wbs_desc")).pack(side="left", padx=4)
+        ttk.Button(wbs_desc_btns, text="Clear All", command=lambda: self.clear_all("wbs_desc")).pack(side="left", padx=4)
+        ttk.Button(wbs_desc_btns, text="Import…", command=lambda: self.import_mapping("wbs_desc")).pack(side="left", padx=4)
+        ttk.Button(wbs_desc_btns, text="Export…", command=lambda: self.export_mapping("wbs_desc")).pack(side="left", padx=4)
 
         # Row 9: Run button
         self.btn_run = ttk.Button(frm, text="Run", command=self.run_clicked)
@@ -620,7 +814,7 @@ class ChargeCodesGUI:
         self.status_box = Text(frm, height=10, width=90, wrap="word")
         self.status_box.grid(row=10, column=1, columnspan=3, sticky="nsew", **pad)
 
-        # Expandable layout
+        # Expandable layout inside the scrollable frame
         frm.columnconfigure(1, weight=1)
         frm.rowconfigure(10, weight=1)
         editors.columnconfigure(0, weight=1)
@@ -629,10 +823,14 @@ class ChargeCodesGUI:
         # Search live filters
         self.clin_search.trace_add("write", lambda *_: self._refresh_mapping_tree("clin"))
         self.phase_search.trace_add("write", lambda *_: self._refresh_mapping_tree("phase"))
+        self.wbs_code_search.trace_add("write", lambda *_: self._refresh_mapping_tree("wbs_code"))
+        self.wbs_desc_search.trace_add("write", lambda *_: self._refresh_mapping_tree("wbs_desc"))
 
         # Toggle checkbox by click
         self.clin_tree.bind("<Button-1>", lambda e: self._on_tree_click(e, "clin"))
         self.phase_tree.bind("<Button-1>", lambda e: self._on_tree_click(e, "phase"))
+        self.wbs_code_tree.bind("<Button-1>", lambda e: self._on_tree_click(e, "wbs_code"))
+        self.wbs_desc_tree.bind("<Button-1>", lambda e: self._on_tree_click(e, "wbs_desc"))
 
         # Init output mode UI
         self._on_output_mode_change()
@@ -761,37 +959,36 @@ class ChargeCodesGUI:
                 except Exception:
                     pass
 
-    # ---------- Tree creation with centered columns ----------
+    # ---------- Tree creation with centered columns & both scrollbars ----------
     def _create_selectable_mapping_tree(self, parent, start_row=0, columns=("✓", "From", "To")):
         tree = ttk.Treeview(parent, columns=columns, show="headings", height=10)
         for idx, col in enumerate(columns):
             tree.heading(col, text=col)
-            width = 80 if idx == 0 else 200
+            width = 120 if idx == 0 else 240
             tree.column(col, width=width, anchor="center")  # center content
         tree.grid(row=start_row, column=0, sticky="nsew")
+
         yscroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
         yscroll.grid(row=start_row, column=1, sticky="ns")
-        tree.configure(yscrollcommand=yscroll.set)
+        xscroll = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        xscroll.grid(row=start_row + 1, column=0, sticky="ew")
+
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         parent.rowconfigure(start_row, weight=1)
+        parent.columnconfigure(0, weight=1)
         return tree
 
     # ---------- Mapping data management ----------
     def _seed_clin_defaults(self):
         """
         Seed CLIN defaults, including a special rule entry that users can toggle:
-          - SPECIAL_CLIN_PAD_KEY: when selected, enables left-padding CLIN to 6 chars.
+        - SPECIAL_CLIN_PAD_KEY: when selected, enables left-padding CLIN to 6 chars.
         """
         self.clin_data = [
-            # Regular sample mappings could go here...
-            # {"selected": True, "from": "0001", "to": "5031AA"},
-            # {"selected": True, "from": "0002", "to": "5031AB"},
-
-            # Special rule row (off by default; user can toggle in UI)
             {"selected": False, "from": self.SPECIAL_CLIN_PAD_KEY, "to": "Add chars until 6 chars"},
         ]
 
     def _seed_phase_defaults(self):
-        # Edit Phase defaults here
         self.phase_data = [
             {"selected": True, "from": "BID", "to": "1BID"},
             {"selected": True, "from": "LOE", "to": "ZLOE"},
@@ -804,6 +1001,12 @@ class ChargeCodesGUI:
             {"selected": True, "from": "GAT", "to": "ZGAT"},
             {"selected": True, "from": "PROD", "to": "ZPROD"},
         ]
+
+    def _seed_wbs_code_defaults(self):
+        self.wbs_code_data = []
+
+    def _seed_wbs_desc_defaults(self):
+        self.wbs_desc_data = []
 
     def _filter_rows(self, dataset, query, upper_keys=False):
         q = query.strip().lower()
@@ -821,21 +1024,26 @@ class ChargeCodesGUI:
         if which == "clin":
             tree = self.clin_tree
             data = self._filter_rows(self.clin_data, self.clin_search.get(), upper_keys=False)
-        else:
+        elif which == "phase":
             tree = self.phase_tree
             data = self._filter_rows(self.phase_data, self.phase_search.get(), upper_keys=True)
+        elif which == "wbs_code":
+            tree = self.wbs_code_tree
+            data = self._filter_rows(self.wbs_code_data, self.wbs_code_search.get(), upper_keys=False)
+        else:  # wbs_desc
+            tree = self.wbs_desc_tree
+            data = self._filter_rows(self.wbs_desc_data, self.wbs_desc_search.get(), upper_keys=True)
 
         for iid in tree.get_children():
             tree.delete(iid)
         tree._row_refs = {}
         for row in data:
             mark = "☑" if row["selected"] else "☐"
-            if which == "phase":
+            if which in ("phase", "wbs_desc"):
                 from_display = row["from"].upper()
                 to_display = row["to"]
             else:
-                # Friendly display for the special CLIN padding rule
-                if row["from"] == self.SPECIAL_CLIN_PAD_KEY:
+                if which == "clin" and row["from"] == self.SPECIAL_CLIN_PAD_KEY:
                     from_display = "CLIN w/less than 6 characters"
                     to_display = row["to"]
                 else:
@@ -845,7 +1053,12 @@ class ChargeCodesGUI:
             tree._row_refs[iid] = row
 
     def _on_tree_click(self, event, which):
-        tree = self.clin_tree if which == "clin" else self.phase_tree
+        tree = {
+            "clin": self.clin_tree,
+            "phase": self.phase_tree,
+            "wbs_code": self.wbs_code_tree,
+            "wbs_desc": self.wbs_desc_tree,
+        }[which]
         region = tree.identify("region", event.x, event.y)
         if region != "cell":
             return
@@ -864,6 +1077,7 @@ class ChargeCodesGUI:
         vals[0] = mark
         tree.item(iid, values=tuple(vals))
 
+    # ---- CLIN mapping CRUD ----
     def add_clin(self):
         dlg = MappingDialog(self.root, "Add CLIN Mapping", from_label="From (CLIN code)", to_label="To (Lot code)")
         if dlg.result:
@@ -873,7 +1087,6 @@ class ChargeCodesGUI:
             if not k or not v:
                 messagebox.showerror("Validation", "Both 'From' and 'To' are required.")
                 return
-            # Prevent duplicate of the special rule key
             if k == self.SPECIAL_CLIN_PAD_KEY:
                 messagebox.showerror("Validation", "The special rule key is reserved by the system.")
                 return
@@ -892,11 +1105,11 @@ class ChargeCodesGUI:
             messagebox.showinfo("Delete", "Select one or more rows in the CLIN mapping to delete.")
             return
         refs = self.clin_tree._row_refs
-        # Do not delete the special rule row via UI
         to_remove = [refs[iid] for iid in sel if refs.get(iid) and refs[iid]["from"] != self.SPECIAL_CLIN_PAD_KEY]
         self.clin_data = [r for r in self.clin_data if r not in to_remove]
         self._refresh_mapping_tree("clin")
 
+    # ---- Phase mapping CRUD ----
     def add_phase(self):
         dlg = MappingDialog(self.root, "Add Phase Mapping", from_label="From (Phase)", to_label="To (Mapped Phase)")
         if dlg.result:
@@ -924,12 +1137,73 @@ class ChargeCodesGUI:
         self.phase_data = [r for r in self.phase_data if r not in [refs[iid] for iid in sel]]
         self._refresh_mapping_tree("phase")
 
+    # ---- WBS Code mapping CRUD ----
+    def add_wbs_code(self):
+        dlg = MappingDialog(self.root, "Add WBS Code Mapping", from_label="From (WBS Code)", to_label="To (Mapped Code)")
+        if dlg.result:
+            k, v = dlg.result
+            k = k.strip()
+            v = v.strip()
+            if not k or not v:
+                messagebox.showerror("Validation", "Both 'From' and 'To' are required.")
+                return
+            for row in self.wbs_code_data:
+                if row["from"] == k:
+                    row["to"] = v
+                    row["selected"] = True
+                    self._refresh_mapping_tree("wbs_code")
+                    return
+            self.wbs_code_data.append({"selected": True, "from": k, "to": v})
+            self._refresh_mapping_tree("wbs_code")
+
+    def delete_wbs_code(self):
+        sel = self.wbs_code_tree.selection()
+        if not sel:
+            messagebox.showinfo("Delete", "Select one or more rows in the WBS code mapping to delete.")
+            return
+        refs = self.wbs_code_tree._row_refs
+        self.wbs_code_data = [r for r in self.wbs_code_data if r not in [refs[iid] for iid in sel]]
+        self._refresh_mapping_tree("wbs_code")
+
+    # ---- WBS Description mapping CRUD ----
+    def add_wbs_desc(self):
+        dlg = MappingDialog(self.root, "Add WBS Description Mapping", from_label="From (Description)", to_label="To (Mapped Description)")
+        if dlg.result:
+            k, v = dlg.result
+            k = k.strip().upper()
+            v = v.strip()
+            if not k or not v:
+                messagebox.showerror("Validation", "Both 'From' and 'To' are required.")
+                return
+            for row in self.wbs_desc_data:
+                if row["from"].upper() == k:
+                    row["to"] = v
+                    row["selected"] = True
+                    self._refresh_mapping_tree("wbs_desc")
+                    return
+            self.wbs_desc_data.append({"selected": True, "from": k, "to": v})
+            self._refresh_mapping_tree("wbs_desc")
+
+    def delete_wbs_desc(self):
+        sel = self.wbs_desc_tree.selection()
+        if not sel:
+            messagebox.showinfo("Delete", "Select one or more rows in the WBS description mapping to delete.")
+            return
+        refs = self.wbs_desc_tree._row_refs
+        self.wbs_desc_data = [r for r in self.wbs_desc_data if r not in [refs[iid] for iid in sel]]
+        self._refresh_mapping_tree("wbs_desc")
+
+    # ---- Selection helpers ----
     def select_all(self, which):
-        tree = self.clin_tree if which == "clin" else self.phase_tree
+        tree = {
+            "clin": self.clin_tree,
+            "phase": self.phase_tree,
+            "wbs_code": self.wbs_code_tree,
+            "wbs_desc": self.wbs_desc_tree,
+        }[which]
         for iid in tree.get_children():
             row = tree._row_refs.get(iid)
             if row:
-                # Don't auto-select the special rule with Select All; keep it explicit
                 if which == "clin" and row["from"] == self.SPECIAL_CLIN_PAD_KEY:
                     continue
                 row["selected"] = True
@@ -938,7 +1212,12 @@ class ChargeCodesGUI:
                 tree.item(iid, values=tuple(vals))
 
     def clear_all(self, which):
-        tree = self.clin_tree if which == "clin" else self.phase_tree
+        tree = {
+            "clin": self.clin_tree,
+            "phase": self.phase_tree,
+            "wbs_code": self.wbs_code_tree,
+            "wbs_desc": self.wbs_desc_tree,
+        }[which]
         for iid in tree.get_children():
             row = tree._row_refs.get(iid)
             if row:
@@ -947,9 +1226,10 @@ class ChargeCodesGUI:
                 vals[0] = "☐"
                 tree.item(iid, values=tuple(vals))
 
+    # ---- Import/Export for mappings (supports all 4 types) ----
     def import_mapping(self, which):
         path = filedialog.askopenfilename(
-            title=f"Import {which.capitalize()} Mapping (CSV or JSON)",
+            title=f"Import {which.replace('_', ' ').title()} Mapping (CSV or JSON)",
             filetypes=[("CSV Files", "*.csv"), ("JSON Files", "*.json"), ("All Files", "*.*")]
         )
         if not path:
@@ -974,21 +1254,16 @@ class ChargeCodesGUI:
                         continue
                     items.append((row[0].strip(), row[1].strip()))
 
-            target = self.clin_data if which == "clin" else self.phase_data
-
             if which == "clin":
-                # Preserve the special rule row; update/merge the rest
+                target = self.clin_data
                 special_row = None
                 for r in target:
                     if r["from"] == self.SPECIAL_CLIN_PAD_KEY:
                         special_row = r
                         break
-                # Rebuild target with special row retained
                 new_target = [special_row] if special_row else []
-                # Merge imported items
                 for k, v in items:
                     if k == self.SPECIAL_CLIN_PAD_KEY:
-                        # Allow setting its 'selected' via 'to' value hint: "on"/"off"
                         if isinstance(v, str) and v.strip().lower() in ("on", "true", "yes", "1"):
                             if special_row:
                                 special_row["selected"] = True
@@ -996,7 +1271,6 @@ class ChargeCodesGUI:
                             if special_row:
                                 special_row["selected"] = False
                         continue
-                    # Add/replace normal mappings
                     found = False
                     for r in new_target:
                         if r and r["from"] == k:
@@ -1006,10 +1280,10 @@ class ChargeCodesGUI:
                             break
                     if not found:
                         new_target.append({"selected": True, "from": k, "to": v})
-                # Assign back
                 self.clin_data = [r for r in new_target if r]
-            else:
-                # Phase: normal merge behavior
+
+            elif which in ("phase", "wbs_desc"):
+                target = self.phase_data if which == "phase" else self.wbs_desc_data
                 for k, v in items:
                     k_use = k.upper()
                     found = False
@@ -1022,34 +1296,56 @@ class ChargeCodesGUI:
                     if not found:
                         target.append({"selected": True, "from": k_use, "to": v})
 
+            elif which == "wbs_code":
+                target = self.wbs_code_data
+                for k, v in items:
+                    found = False
+                    for r in target:
+                        if r["from"] == k:
+                            r["to"] = v
+                            r["selected"] = True
+                            found = True
+                            break
+                    if not found:
+                        target.append({"selected": True, "from": k, "to": v})
+
             self._refresh_mapping_tree(which)
-            messagebox.showinfo("Import", f"Imported {which} mappings from:\n{path}")
+            messagebox.showinfo("Import", f"Imported {which.replace('_', ' ').title()} mappings from:\n{path}")
+
         except Exception as ex:
             messagebox.showerror("Import Error", f"Failed to import:\n{ex}")
 
     def export_mapping(self, which):
         path = filedialog.asksaveasfilename(
-            title=f"Export {which.capitalize()} Mapping",
+            title=f"Export {which.replace('_', ' ').title()} Mapping",
             defaultextension=".csv",
             filetypes=[("CSV Files", "*.csv"), ("JSON Files", "*.json")]
         )
         if not path:
             return
         p = pathlib.Path(path)
-        target = self.clin_data if which == "clin" else self.phase_data
+        target = {
+            "clin": self.clin_data,
+            "phase": self.phase_data,
+            "wbs_code": self.wbs_code_data,
+            "wbs_desc": self.wbs_desc_data
+        }[which]
         try:
             if p.suffix.lower() == ".json":
                 if which == "clin":
                     obj = {}
                     for r in target:
                         key = r["from"]
-                        # For the special rule, export "on"/"off" flag in the 'to' field
                         val = ("on" if (r["from"] == self.SPECIAL_CLIN_PAD_KEY and r["selected"]) else r["to"])
                         obj[key] = val
                     with open(p, "w", encoding="utf-8") as f:
                         json.dump(obj, f, indent=2)
-                else:
+                elif which in ("phase", "wbs_desc"):
                     obj = {r["from"].upper(): r["to"] for r in target}
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(obj, f, indent=2)
+                else:  # wbs_code
+                    obj = {r["from"]: r["to"] for r in target}
                     with open(p, "w", encoding="utf-8") as f:
                         json.dump(obj, f, indent=2)
             else:
@@ -1057,10 +1353,13 @@ class ChargeCodesGUI:
                     writer = csv.writer(f)
                     writer.writerow(["From", "To"])
                     for r in target:
-                        key = (r["from"].upper() if which == "phase" else r["from"])
+                        if which in ("phase", "wbs_desc"):
+                            key = r["from"].upper()
+                        else:
+                            key = r["from"]
                         val = ("on" if (which == "clin" and r["from"] == self.SPECIAL_CLIN_PAD_KEY and r["selected"]) else r["to"])
                         writer.writerow([key, val])
-            messagebox.showinfo("Export", f"Exported {which} mappings to:\n{path}")
+            messagebox.showinfo("Export", f"Exported {which.replace('_', ' ').title()} mappings to:\n{path}")
         except Exception as ex:
             messagebox.showerror("Export Error", f"Failed to export:\n{ex}")
 
@@ -1073,15 +1372,22 @@ class ChargeCodesGUI:
         return False
 
     def _build_mapping_dict(self, which):
-        """Build mapping dict using ONLY rows with selected=True (phase keys uppercased)."""
-        src = self.clin_data if which == "clin" else self.phase_data
+        """
+        Build mapping dict using ONLY rows with selected=True.
+        Keys uppercased for 'phase' and 'wbs_desc' (case-insensitive matching).
+        """
+        src = {
+            "clin": self.clin_data,
+            "phase": self.phase_data,
+            "wbs_code": self.wbs_code_data,
+            "wbs_desc": self.wbs_desc_data
+        }[which]
         d = {}
         for r in src:
             if r["selected"]:
-                # Skip special rule rows when building dict
                 if which == "clin" and r["from"] == self.SPECIAL_CLIN_PAD_KEY:
                     continue
-                key = r["from"].upper() if which == "phase" else r["from"]
+                key = r["from"].upper() if which in ("phase", "wbs_desc") else r["from"]
                 d[key] = r["to"]
         return d
 
@@ -1121,14 +1427,13 @@ class ChargeCodesGUI:
             filetypes=[("Excel files", "*.xlsx")]
         )
         if path:
-            # ensure .xlsx
             p = pathlib.Path(path)
             if p.suffix.lower() != ".xlsx":
                 p = p.with_suffix(".xlsx")
             self.output_file_path.set(str(p))
 
     def _sanitize_filename(self, name: str) -> str:
-        sanitized = re.sub(r'[\<>:"/\\\|\?\*]+', "_", name).strip()
+        sanitized = re.sub(r'[\<\>:"/\\\|\?\*]+', "_", name).strip()
         return sanitized or "Charge_Codes"
 
     def _final_output_path(self) -> pathlib.Path:
@@ -1145,7 +1450,6 @@ class ChargeCodesGUI:
             return folder / p.name
         else:
             fp = pathlib.Path(self.output_file_path.get().strip())
-            # Enforce .xlsx
             if fp.suffix.lower() != ".xlsx":
                 fp = fp.with_suffix(".xlsx")
             return fp
@@ -1191,10 +1495,8 @@ class ChargeCodesGUI:
                 errs.append("Output file path is required in 'Single File Path' mode.")
             else:
                 fp = pathlib.Path(out_file)
-                # The parent directory must exist
                 if not fp.parent.exists():
                     errs.append(f"Output file folder does not exist: {fp.parent}")
-                # will enforce .xlsx later; warn if wrong
                 if fp.suffix and fp.suffix.lower() not in [".xlsx", ".xlsm"]:
                     errs.append("Output file must end with .xlsx (we will enforce .xlsx).")
 
@@ -1225,14 +1527,18 @@ class ChargeCodesGUI:
             proj = self.project_number.get().strip()
             selected = self.contract_type.get().strip()
             ctype = self._parse_contract_code(selected) or "1"
-
             final_out_path = self._final_output_path()
 
             # Build mapping dicts from selected rows only
             clin_map = self._build_mapping_dict("clin")
             phase_map = self._build_mapping_dict("phase")
+            wbs_code_map = self._build_mapping_dict("wbs_code")
+            wbs_desc_map = self._build_mapping_dict("wbs_desc")
+
             enable_clin = bool(self.use_clin_map.get())
             enable_phase = bool(self.use_phase_map.get())
+            enable_wbs_code = bool(self.use_wbs_code_map.get())
+            enable_wbs_desc = bool(self.use_wbs_desc_map.get())
 
             # Rule flag from CLIN mapping UI
             pad_clin_to_6 = self._clin_pad_enabled()
@@ -1247,8 +1553,12 @@ class ChargeCodesGUI:
                 contract_type=ctype,
                 clin_map=clin_map,
                 phase_map=phase_map,
+                wbs_code_map=wbs_code_map,
+                wbs_desc_map=wbs_desc_map,
                 enable_clin_map=enable_clin,
                 enable_phase_map=enable_phase,
+                enable_wbs_code_map=enable_wbs_code,
+                enable_wbs_desc_map=enable_wbs_desc,
                 pad_clin_to_6=pad_clin_to_6,
             )
 
@@ -1281,7 +1591,8 @@ def main_gui():
     except Exception:
         pass
     app = ChargeCodesGUI(root)
-    root.geometry("1180x800")
+    root.geometry("1180x900")
+    root.minsize(800, 600)  # ensure reasonable minimum while scroll handles overflow
     root.mainloop()
 
 if __name__ == "__main__":
