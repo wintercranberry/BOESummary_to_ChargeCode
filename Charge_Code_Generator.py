@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Charge Code Generator GUI (Tkinter)
+Charge Code Generator GUI (CustomTkinter + Accordion) — Version 2.1.0
 
-Features:
+Theme fixes:
+- Root is always a CustomTkinter window—even with tkinterdnd2 (DnD)—via CTkDnD hybrid class.
+- Mapping windows (ttk.Treeview + ttk.Scrollbar) are styled to match CTk dark/light appearance using a TtkStyler.
+- Styles update live when Appearance changes (System/Light/Dark).
+- White borders eliminated by using flat/zero border styles on ttk widgets.
+
+Features preserved from original:
 - Input: Browse file or folder; optional drag & drop (via tkinterdnd2 if installed).
 - Level 1: Project Number (text).
 - Level 2: Contract Type (dropdown; e.g., "1: FFP", "2: CRNF") + editor dialog.
@@ -12,22 +18,21 @@ Features:
   • WBS Code (maps numeric 6-char code extracted from WBS text)
   • WBS Description (case-insensitive keys, uppercased)
   (All mapping trees support vertical AND horizontal scrolling.)
-- Main window: Vertical scroll wheel support via ScrollableFrame (Canvas + scrollbar).
+- Main window: Vertical scroll via CustomTkinter ScrollableFrame.
 - Output: Choose either:
   (A) Output Folder + File Name (default "Charge_Codes") with Drag & Drop, OR
   (B) Single Output File Path (.xlsx) with Drag & Drop
   We force .xlsx as the final extension.
 - Threaded run; status log; full error stacktraces.
+- Preferences saved to %APPDATA%/ChargeCodeGenerator/config.json
 
 Dependencies:
-- Required: pandas, openpyxl
+- Required: pandas, openpyxl, customtkinter
 - Optional (for drag & drop): tkinterdnd2
 
-Version 2.0.0
-
-Implemented mapping for wbs and wbs description and added scroll wheels for each
-added scroll wheel for entire window
-added CLIN mapping regex
+Run:
+    pip install pandas openpyxl customtkinter
+    pip install tkinterdnd2   # optional, for drag & drop
 """
 
 import re
@@ -37,24 +42,24 @@ import traceback
 import json
 import csv
 import os
+import sys
 import pandas as pd
-from tkinter import Tk, StringVar, BooleanVar, END, Toplevel, Canvas  # <-- Canvas imported here
-from tkinter import filedialog, messagebox
-from tkinter import ttk
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+# --- CustomTkinter ---
+import customtkinter as ctk
 
 # Try to enable drag & drop (tkinterdnd2)
 DND_AVAILABLE = False
-TkRootClass = Tk
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     DND_AVAILABLE = True
-    TkRootClass = TkinterDnD.Tk
 except Exception:
     DND_AVAILABLE = False
-    TkRootClass = Tk
 
 # --------------------------
-# Core logic
+# Core logic (unchanged)
 # --------------------------
 
 def _find_column(df, keywords):
@@ -88,7 +93,6 @@ def _extract_wbs_desc(wbs_text):
     if not m:
         return None
     rest = s[m.end():].strip()
-    # remove a leading separator + spaces
     rest = re.sub(r"^\s*[-–—:]\s*", "", rest)
     return rest or None
 
@@ -112,11 +116,8 @@ def _extract_clin(clin_text, clin_map=None, enable_map=True, pad_to_6=False):
         return None
     s = str(clin_text).strip()
     m = re.search(r"\bCLIN\s*(\w+)\b", s, flags=re.IGNORECASE)
-    code = m.group(1).strip() if m else (
-        re.search(r"\b(\w+)\b", s).group(1).strip() if re.search(r"\b(\w+)\b", s) else s
-    )
+    code = m.group(1).strip() if m else (re.search(r"\b(\w+)\b", s).group(1).strip() if re.search(r"\b(\w+)\b", s) else s)
     code = code.strip()
-    # Optional: default-pad CLIN to 6 characters with leading zeros
     if pad_to_6 and len(code) < 6:
         code = code.rjust(6, '0')
     if enable_map and clin_map:
@@ -171,7 +172,7 @@ def read_boe_summary_multi(input_path):
         dfs = []
         for f in files:
             df = read_boe_summary_single(f)
-            df["__SourceFile__"] = f.name  # optional provenance
+            df["__SourceFile__"] = f.name
             dfs.append(df)
         out = pd.concat(dfs, ignore_index=True)
         out = out.astype(str)
@@ -208,7 +209,6 @@ def build_paths(
         level4 = _map_wbs_code(raw_wbs_code, wbs_code_map=wbs_code_map, enable_map=enable_wbs_code_map)
         level5 = _normalize_phase(r.get(phase_col), phase_map=phase_map, enable_map=enable_phase_map)
 
-        # WBS description parsed and optionally mapped
         raw_desc = _extract_wbs_desc(r.get(wbs_col))
         wbs_desc_final = _normalize_wbs_desc(raw_desc, wbs_desc_map=wbs_desc_map, enable_map=enable_wbs_desc_map)
 
@@ -245,7 +245,7 @@ def expand_hierarchy(paths):
         vals = {lvl: paths_row[lvl] if lvl in levels_present else "" for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]}
         parts = [paths_row[lvl] for lvl in levels_present]
         vals["Charge String"] = ".".join(parts) + "."
-        vals["WBS Description"] = ""  # blank for partial rows
+        vals["WBS Description"] = ""
         return vals
 
     for _, paths_row in paths.iterrows():
@@ -271,7 +271,6 @@ def expand_hierarchy(paths):
 
         full_vals = {lvl: paths_row[lvl] for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]}
         full_vals["Charge String"] = ".".join([paths_row[lvl] for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]])
-        # Populate description on the FULL row
         full_vals["WBS Description"] = paths_row.get("WBS Description", "")
         out.append(full_vals)
         last["Level 5"] = paths_row["Level 5"]
@@ -288,10 +287,100 @@ def write_output_excel(df_out, output_path):
     return output_path
 
 # --------------------------
-# Tkinter GUI Implementation
+# Theme-aware ttk styler
 # --------------------------
 
-class MappingDialog(Toplevel):
+class TtkStyler:
+    """
+    A tiny style adapter to make ttk widgets (Treeview/Scrollbars) match CustomTkinter appearance.
+    Call .apply() whenever appearance changes. Assign "Custom.Treeview" to Treeviews.
+    """
+    def __init__(self):
+        self.style = ttk.Style()
+
+    def apply(self):
+        # Force 'clam' so bg/fg configs are respected on most platforms.
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+        mode = ctk.get_appearance_mode()  # "Dark" or "Light"
+        if mode == "Dark":
+            bg = "#2b2b2b"         # main bg
+            fg = "#eeeeee"         # text
+            tr_bg = "#3a3a3a"      # tree bg
+            hd_bg = "#444444"      # header bg
+            sel_bg = "#1f6aa5"     # CTk blue
+            sel_fg = "#ffffff"
+            sb_bg = "#404040"      # scrollbar bg
+            trough = "#2b2b2b"
+        else:
+            bg = "#ebebeb"
+            fg = "#000000"
+            tr_bg = "#f5f5f5"
+            hd_bg = "#d9d9d9"
+            sel_bg = "#1f6aa5"
+            sel_fg = "#ffffff"
+            sb_bg = "#d0d0d0"
+            trough = "#ebebeb"
+
+        # Treeview rows & body
+        self.style.configure(
+            "Custom.Treeview",
+            background=tr_bg,
+            foreground=fg,
+            fieldbackground=tr_bg,
+            borderwidth=0,
+            relief="flat",
+            rowheight=24,
+        )
+        self.style.map(
+            "Custom.Treeview",
+            background=[("selected", sel_bg)],
+            foreground=[("selected", sel_fg)],
+        )
+
+        # Header styling
+        self.style.configure(
+            "Custom.Treeview.Heading",
+            background=hd_bg,
+            foreground=fg,
+            borderwidth=0,
+            relief="flat",
+        )
+        self.style.map(
+            "Custom.Treeview.Heading",
+            background=[("active", hd_bg)],
+            foreground=[("active", fg)]
+        )
+
+        # Scrollbars
+        for orient in ("Vertical", "Horizontal"):
+            name = f"{orient}.TScrollbar"
+            self.style.configure(
+                name,
+                background=sb_bg,
+                troughcolor=trough,
+                bordercolor=trough,
+                lightcolor=trough,
+                darkcolor=trough,
+            )
+
+    def style_tree(self, tree: ttk.Treeview):
+        """Apply our style and clean up borders."""
+        try:
+            tree.configure(style="Custom.Treeview")
+            tree.configure(selectmode="extended")
+        except Exception:
+            pass
+
+
+# --------------------------
+# CustomTkinter GUI
+# --------------------------
+
+class MappingDialog(ctk.CTkToplevel):
     """Simple modal dialog to add/edit a mapping pair."""
     def __init__(self, parent, title, from_label="From", to_label="To", initial_from="", initial_to=""):
         super().__init__(parent)
@@ -299,26 +388,28 @@ class MappingDialog(Toplevel):
         self.resizable(False, False)
         self.result = None
 
-        pad = {"padx": 8, "pady": 6}
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, **pad)
+        pad_x, pad_y = 8, 6
+        frm = ctk.CTkFrame(self)
+        frm.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
 
-        ttk.Label(frm, text=from_label + ":").grid(row=0, column=0, sticky="w", **pad)
-        self.var_from = StringVar(value=initial_from)
-        ttk.Entry(frm, textvariable=self.var_from, width=30).grid(row=0, column=1, sticky="w", **pad)
+        ctk.CTkLabel(frm, text=from_label + ":").grid(row=0, column=0, sticky="w", padx=pad_x, pady=pad_y)
+        self.var_from = tk.StringVar(value=initial_from)
+        ctk.CTkEntry(frm, textvariable=self.var_from, width=280).grid(row=0, column=1, sticky="w", padx=pad_x, pady=pad_y)
 
-        ttk.Label(frm, text=to_label + ":").grid(row=1, column=0, sticky="w", **pad)
-        self.var_to = StringVar(value=initial_to)
-        ttk.Entry(frm, textvariable=self.var_to, width=30).grid(row=1, column=1, sticky="w", **pad)
+        ctk.CTkLabel(frm, text=to_label + ":").grid(row=1, column=0, sticky="w", padx=pad_x, pady=pad_y)
+        self.var_to = tk.StringVar(value=initial_to)
+        ctk.CTkEntry(frm, textvariable=self.var_to, width=280).grid(row=1, column=1, sticky="w", padx=pad_x, pady=pad_y)
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=2, column=0, columnspan=2, sticky="e", **pad)
-        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=5)
-        ttk.Button(btns, text="OK", command=self._ok).pack(side="right", padx=5)
+        btns = ctk.CTkFrame(frm)
+        btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=pad_x, pady=pad_y)
+        ctk.CTkButton(btns, text="Cancel", command=self._cancel).pack(side="right", padx=5)
+        ctk.CTkButton(btns, text="OK", command=self._ok).pack(side="right", padx=5)
 
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_visibility()
+        self.focus()
         self.wait_window(self)
 
     def _ok(self):
@@ -337,7 +428,7 @@ class MappingDialog(Toplevel):
         self.result = None
         self.destroy()
 
-class ContractTypesEditor(Toplevel):
+class ContractTypesEditor(ctk.CTkToplevel):
     """Modal editor for Contract Type list: items like '1: FFP', '2: CRNF'."""
     def __init__(self, parent, contract_items):
         super().__init__(parent)
@@ -345,47 +436,56 @@ class ContractTypesEditor(Toplevel):
         self.resizable(True, True)
         self.result = None
 
-        pad = {"padx": 8, "pady": 6}
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, **pad)
+        pad_x, pad_y = 8, 6
+        frm = ctk.CTkFrame(self)
+        frm.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
 
-        ttk.Label(frm, text="Contract Types (Code / Label):").grid(row=0, column=0, sticky="w", **pad)
+        ctk.CTkLabel(frm, text="Contract Types (Code / Label):").grid(row=0, column=0, sticky="w", padx=pad_x, pady=pad_y)
+
+        # Tree + Scrollbars
         self.tree = ttk.Treeview(frm, columns=("Code", "Label"), show="headings", height=10)
         self.tree.heading("Code", text="Code")
         self.tree.heading("Label", text="Label")
-        self.tree.column("Code", width=100, anchor="center")
-        self.tree.column("Label", width=220, anchor="center")
-        self.tree.grid(row=1, column=0, sticky="nsew", **pad)
+        self.tree.column("Code", width=120, anchor="center")
+        self.tree.column("Label", width=260, anchor="center")
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=pad_x, pady=pad_y)
 
         yscroll = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(frm, orient="horizontal", command=self.tree.xview)
-        xscroll.grid(row=2, column=0, sticky="ew", **pad)
+        xscroll.grid(row=2, column=0, sticky="ew", padx=pad_x, pady=pad_y)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         for item in contract_items:
             code, label = self._split_item(item)
-            self.tree.insert("", END, values=(code, label))
+            self.tree.insert("", tk.END, values=(code, label))
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, sticky="w", **pad)
-        ttk.Button(btns, text="Add", command=self.add_item).pack(side="left", padx=4)
-        ttk.Button(btns, text="Edit", command=self.edit_item).pack(side="left", padx=4)
-        ttk.Button(btns, text="Delete", command=self.delete_item).pack(side="left", padx=4)
-        ttk.Button(btns, text="Import…", command=self.import_items).pack(side="left", padx=4)
-        ttk.Button(btns, text="Export…", command=self.export_items).pack(side="left", padx=4)
+        btns = ctk.CTkFrame(frm)
+        btns.grid(row=3, column=0, sticky="w", padx=pad_x, pady=pad_y)
+        ctk.CTkButton(btns, text="Add", command=self.add_item).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Edit", command=self.edit_item).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Delete", command=self.delete_item).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Import…", command=self.import_items).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="Export…", command=self.export_items).pack(side="left", padx=4)
 
-        action = ttk.Frame(frm)
-        action.grid(row=4, column=0, sticky="e", **pad)
-        ttk.Button(action, text="Cancel", command=self._cancel).pack(side="right", padx=5)
-        ttk.Button(action, text="OK", command=self._ok).pack(side="right", padx=5)
+        action = ctk.CTkFrame(frm)
+        action.grid(row=4, column=0, sticky="e", padx=pad_x, pady=pad_y)
+        ctk.CTkButton(action, text="Cancel", command=self._cancel).pack(side="right", padx=5)
+        ctk.CTkButton(action, text="OK", command=self._ok).pack(side="right", padx=5)
 
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(1, weight=1)
 
+        # Make ttk tree adopt theme
+        self._styler = TtkStyler()
+        self._styler.apply()
+        self._styler.style_tree(self.tree)
+
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.wait_visibility()
+        self.focus()
         self.wait_window(self)
 
     def _split_item(self, s):
@@ -409,7 +509,7 @@ class ContractTypesEditor(Toplevel):
                 if c == code:
                     self.tree.item(iid, values=(code, label))
                     return
-            self.tree.insert("", END, values=(code, label))
+            self.tree.insert("", tk.END, values=(code, label))
 
     def edit_item(self):
         sel = self.tree.selection()
@@ -475,7 +575,7 @@ class ContractTypesEditor(Toplevel):
                 self.tree.delete(iid)
             for code, label in items:
                 if code and label:
-                    self.tree.insert("", END, values=(code, label))
+                    self.tree.insert("", tk.END, values=(code, label))
             messagebox.showinfo("Import", f"Imported contract types from:\n{path}")
         except Exception as ex:
             messagebox.showerror("Import Error", f"Failed to import:\n{ex}")
@@ -526,312 +626,281 @@ class ContractTypesEditor(Toplevel):
         self.result = None
         self.destroy()
 
-# ---------- ScrollableFrame for main window (vertical scroll) ----------
-class ScrollableFrame(ttk.Frame):
-    """
-    A reusable scrollable container: Canvas + vertical scrollbar with a child Frame.
-    Binds mouse wheel for Windows/macOS and Button-4/5 for Linux.
-    """
-    def __init__(self, parent, *args, **kwargs):
+# ---------- Accordion ----------
+
+class AccordionSection(ctk.CTkFrame):
+    """A simple expandable/collapsible section."""
+    def __init__(self, parent, title: str, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
+        self._expanded = True
+        self._title = title
 
-        # Use tk.Canvas (not ttk.Canvas)
-        self.canvas = Canvas(self, highlightthickness=0)
-        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vscroll.set)
+        self.header = ctk.CTkButton(
+            self, text=f"▼ {title}", anchor="w",
+            fg_color="transparent", hover=False, command=self.toggle
+        )
+        self.header.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 0))
 
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vscroll.grid(row=0, column=1, sticky="ns")
+        self.content = ctk.CTkFrame(self)
+        self.content.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
 
-        # The inner frame that holds actual content
-        self.frame = ttk.Frame(self.canvas)
-        self._window = self.canvas.create_window((0, 0), window=self.frame, anchor="nw")
-
-        # Configure expansion
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        # Update scrollregion whenever the inner frame resizes
-        self.frame.bind("<Configure>", self._on_frame_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-
-        # Mouse wheel bindings (Windows/macOS)
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        # Mouse wheel bindings (Linux/X11)
-        self.canvas.bind_all("<Button-4>", lambda e: self._scroll_units(-3))
-        self.canvas.bind_all("<Button-5>", lambda e: self._scroll_units(+3))
-
-    def _on_frame_configure(self, event):
-        # Set scroll region to encompass the inner frame
-        self.canvas.configure(scrollregion=self.canvas.bbox(self._window))
-
-    def _on_canvas_configure(self, event):
-        # Make the inner frame the same width as the canvas so it fills horizontally
-        self.canvas.itemconfigure(self._window, width=event.width)
-
-    def _on_mousewheel(self, event):
-        # On Windows, event.delta is multiples of 120; on macOS, may be small ints
-        delta = event.delta
-        if delta == 0:
-            return
-        step = -1 if delta > 0 else +1
-        # Multiply for a comfortable scroll speed
-        self._scroll_units(step * 3)
-
-    def _scroll_units(self, units):
-        self.canvas.yview_scroll(units, "units")
+    def toggle(self):
+        self._expanded = not self._expanded
+        self.header.configure(text=("▼ " if self._expanded else "▶ ") + self._title)
+        if self._expanded:
+            self.content.grid()
+        else:
+            self.content.grid_remove()
 
 class ChargeCodesGUI:
     SPECIAL_CLIN_PAD_KEY = "__PAD_TO_6__"  # internal marker for the rule
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Charge Code Generator (BOE Summary → Hierarchy) Version 2.0.0")
+        self.root.title("Charge Code Generator (BOE Summary → Hierarchy) — v2.1.0")
 
-        # Config file path
+        # Theme & scaling
+        ctk.set_appearance_mode("System")  # "Light", "Dark", or "System"
+        ctk.set_default_color_theme("blue")
+        ctk.set_widget_scaling(1.0)
+        ctk.set_window_scaling(1.0)
+
+        # Ttk styler for Treeviews/Scrollbars
+        self._styler = TtkStyler()
+        self._styler.apply()
+
+        # Config paths
         appdata = os.environ.get('APPDATA', str(pathlib.Path.home()))
         self.config_dir = pathlib.Path(appdata) / 'ChargeCodeGenerator'
         self.config_path = self.config_dir / 'config.json'
 
         # Vars
-        self.input_path = StringVar()
-        self.project_number = StringVar()
-        self.contract_type = StringVar()  # holds selected string, e.g., "1: FFP"
+        self.input_path = tk.StringVar()
+        self.project_number = tk.StringVar()
+        self.contract_type = tk.StringVar()
 
-        # Output mode: 'folder' or 'file'
-        self.output_mode = StringVar(value="folder")
-        self.output_dir = StringVar()
-        self.output_filename = StringVar(value="Charge_Codes")
-        self.output_file_path = StringVar()
+        self.output_mode = tk.StringVar(value="folder")  # 'folder' or 'file'
+        self.output_dir = tk.StringVar()
+        self.output_filename = tk.StringVar(value="Charge_Codes")
+        self.output_file_path = tk.StringVar()
 
-        # Level 2 defaults (edit here)
+        # Level 2 defaults
         self.contract_options = ["1: FFP", "2: CRNF"]
 
         # Mapping toggles
-        self.use_clin_map = BooleanVar(value=True)
-        self.use_phase_map = BooleanVar(value=True)
-        self.use_wbs_code_map = BooleanVar(value=True)
-        self.use_wbs_desc_map = BooleanVar(value=True)
+        self.use_clin_map = tk.BooleanVar(value=True)
+        self.use_phase_map = tk.BooleanVar(value=True)
+        self.use_wbs_code_map = tk.BooleanVar(value=True)
+        self.use_wbs_desc_map = tk.BooleanVar(value=True)
 
-        # Mapping datasets with selection flags
-        self.clin_data = []        # list of dicts: {'selected':bool,'from':str,'to':str}
-        self.phase_data = []       # same structure (keys uppercased on display)
-        self.wbs_code_data = []    # mapping for Level 4 (WBS code)
-        self.wbs_desc_data = []    # mapping for WBS Description (case-insensitive, use upper keys)
+        # Mapping datasets
+        self.clin_data = []       # {'selected':bool,'from':str,'to':str}
+        self.phase_data = []      # keys uppercased on display
+        self.wbs_code_data = []
+        self.wbs_desc_data = []
 
         # Search vars
-        self.clin_search = StringVar()
-        self.phase_search = StringVar()
-        self.wbs_code_search = StringVar()
-        self.wbs_desc_search = StringVar()
+        self.clin_search = tk.StringVar()
+        self.phase_search = tk.StringVar()
+        self.wbs_code_search = tk.StringVar()
+        self.wbs_desc_search = tk.StringVar()
 
-        pad = {"padx": 8, "pady": 6}
+        # Top bar (theme switch)
+        topbar = ctk.CTkFrame(self.root)
+        topbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 0))
+        ctk.CTkLabel(topbar, text="Appearance:").pack(side="left", padx=(4, 4))
+        self.theme_opt = ctk.CTkOptionMenu(topbar, values=["System", "Light", "Dark"], command=self._on_theme_change)
+        self.theme_opt.set("System")
+        self.theme_opt.pack(side="left")
 
-        # Use ScrollableFrame for the entire main content
-        scrollable = ScrollableFrame(root)
-        scrollable.grid(row=0, column=0, sticky="nsew")
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=1)
+        # Main scrollable content
+        scrollable = ctk.CTkScrollableFrame(self.root)
+        scrollable.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
-        frm = scrollable.frame  # place all widgets inside this frame
+        frm = scrollable  # place all widgets inside this scrollable frame
 
-        # Row 0: Input (file or folder) with browse + optional drag & drop
-        ttk.Label(frm, text="Input (Excel file or folder):").grid(row=0, column=0, sticky="w", **pad)
-        self.input_entry = ttk.Entry(frm, textvariable=self.input_path, width=60)
-        self.input_entry.grid(row=0, column=1, sticky="ew", **pad)
+        # --- Input row ---
+        ctk.CTkLabel(frm, text="Input (Excel file or folder):").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        self.input_entry = ctk.CTkEntry(frm, textvariable=self.input_path, width=500)
+        self.input_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        ctk.CTkButton(frm, text="Browse File…", command=self.browse_input_file).grid(row=0, column=2, padx=4, pady=6)
+        ctk.CTkButton(frm, text="Browse Folder…", command=self.browse_input_folder).grid(row=0, column=3, padx=4, pady=6)
+
         if DND_AVAILABLE:
-            try:
-                self.input_entry.drop_target_register(DND_FILES)
-                self.input_entry.dnd_bind("<<Drop>>", self._on_drop_input)
-            except Exception:
-                pass
-        ttk.Button(frm, text="Browse File…", command=self.browse_input_file).grid(row=0, column=2, **pad)
-        ttk.Button(frm, text="Browse Folder…", command=self.browse_input_folder).grid(row=0, column=3, **pad)
-        if not DND_AVAILABLE:
-            ttk.Label(frm, text="(Drag & drop available if 'tkinterdnd2' is installed)").grid(row=1, column=1, sticky="w", **pad)
+            self._safe_register_dnd(self.input_entry, self._on_drop_input)
+        else:
+            ctk.CTkLabel(frm, text="(Drag & drop available if 'tkinterdnd2' is installed)").grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
-        # Row 2: Project Number
-        ttk.Label(frm, text="Project Number (Level 1):").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.project_number, width=30).grid(row=2, column=1, sticky="w", **pad)
+        # --- Project Number ---
+        ctk.CTkLabel(frm, text="Project Number (Level 1):").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkEntry(frm, textvariable=self.project_number, width=240).grid(row=2, column=1, sticky="w", padx=8, pady=6)
 
-        # Row 3: Contract Type (Level 2) dropdown + editor
-        ttk.Label(frm, text="Contract Type (Level 2):").grid(row=3, column=0, sticky="w", **pad)
-        self.contract_combo = ttk.Combobox(
-            frm, textvariable=self.contract_type, values=self.contract_options, state="readonly", width=30
-        )
-        self.contract_combo.grid(row=3, column=1, sticky="w", **pad)
+        # --- Contract Type ---
+        ctk.CTkLabel(frm, text="Contract Type (Level 2):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        self.contract_combo = ctk.CTkComboBox(frm, values=self.contract_options, variable=self.contract_type, width=240)
+        self.contract_combo.grid(row=3, column=1, sticky="w", padx=8, pady=6)
         if self.contract_options:
-            self.contract_combo.current(0)
-        ttk.Button(frm, text="Edit…", command=self.edit_contract_types).grid(row=3, column=2, **pad)
+            self.contract_combo.set(self.contract_options[0])
+        ctk.CTkButton(frm, text="Edit…", command=self.edit_contract_types).grid(row=3, column=2, padx=4, pady=6)
 
-        # Row 4: Output mode controls (radio buttons side-by-side)
-        ttk.Label(frm, text="Output Mode:").grid(row=4, column=0, sticky="w", **pad)
-        output_mode_frame = ttk.Frame(frm)
-        output_mode_frame.grid(row=4, column=1, sticky="w", **pad)
-        rb_folder = ttk.Radiobutton(
-            output_mode_frame, text="Folder + File Name", variable=self.output_mode, value="folder",
-            command=self._on_output_mode_change
-        )
-        rb_file = ttk.Radiobutton(
-            output_mode_frame, text="Single File Path", variable=self.output_mode, value="file",
-            command=self._on_output_mode_change
-        )
-        rb_folder.pack(side="left", padx=(0, 8))
+        # --- Output Mode ---
+        ctk.CTkLabel(frm, text="Output Mode:").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        output_mode_frame = ctk.CTkFrame(frm)
+        output_mode_frame.grid(row=4, column=1, sticky="w", padx=8, pady=6)
+        rb_folder = ctk.CTkRadioButton(output_mode_frame, text="Folder + File Name", variable=self.output_mode, value="folder", command=self._on_output_mode_change)
+        rb_file = ctk.CTkRadioButton(output_mode_frame, text="Single File Path", variable=self.output_mode, value="file", command=self._on_output_mode_change)
+        rb_folder.pack(side="left", padx=(0, 12))
         rb_file.pack(side="left")
 
-        # Row 5-6: Folder + File Name (default mode)
-        self.row_output_folder_label = ttk.Label(frm, text="Output Folder:")
-        self.row_output_folder_label.grid(row=5, column=0, sticky="w", **pad)
-        self.row_output_folder_entry = ttk.Entry(frm, textvariable=self.output_dir, width=60)
-        self.row_output_folder_entry.grid(row=5, column=1, sticky="ew", **pad)
-        self.row_output_folder_browse = ttk.Button(frm, text="Browse…", command=self.browse_output_dir)
-        self.row_output_folder_browse.grid(row=5, column=2, **pad)
+        # --- Output rows (folder mode default) ---
+        self.row_output_folder_label = ctk.CTkLabel(frm, text="Output Folder:")
+        self.row_output_folder_label.grid(row=5, column=0, sticky="w", padx=8, pady=6)
+        self.row_output_folder_entry = ctk.CTkEntry(frm, textvariable=self.output_dir, width=500)
+        self.row_output_folder_entry.grid(row=5, column=1, sticky="ew", padx=8, pady=6)
+        ctk.CTkButton(frm, text="Browse…", command=self.browse_output_dir).grid(row=5, column=2, padx=4, pady=6)
         if DND_AVAILABLE:
-            try:
-                self.row_output_folder_entry.drop_target_register(DND_FILES)
-                self.row_output_folder_entry.dnd_bind("<<Drop>>", self._on_drop_output_folder)
-            except Exception:
-                pass
+            self._safe_register_dnd(self.row_output_folder_entry, self._on_drop_output_folder)
 
-        self.row_output_name_label = ttk.Label(frm, text="Output File Name:")
-        self.row_output_name_label.grid(row=6, column=0, sticky="w", **pad)
-        self.row_output_name_entry = ttk.Entry(frm, textvariable=self.output_filename, width=30)
-        self.row_output_name_entry.grid(row=6, column=1, sticky="w", **pad)
-        ttk.Label(frm, text="(default: Charge_Codes; .xlsx will be added)").grid(row=6, column=2, sticky="w", **pad)
+        self.row_output_name_label = ctk.CTkLabel(frm, text="Output File Name:")
+        self.row_output_name_label.grid(row=6, column=0, sticky="w", padx=8, pady=6)
+        self.row_output_name_entry = ctk.CTkEntry(frm, textvariable=self.output_filename, width=240)
+        self.row_output_name_entry.grid(row=6, column=1, sticky="w", padx=8, pady=6)
+        ctk.CTkLabel(frm, text="(default: Charge_Codes; .xlsx will be added)").grid(row=6, column=2, sticky="w", padx=4, pady=6)
 
-        # Row 7: Output File Path (hidden initially)
-        self.row_output_file_label = ttk.Label(frm, text="Output File (.xlsx):")
-        self.row_output_file_entry = ttk.Entry(frm, textvariable=self.output_file_path, width=60)
-        self.row_output_file_browse = ttk.Button(frm, text="Browse…", command=self.browse_output_file)
+        # -- Single output path (hidden initially) --
+        self.row_output_file_label = ctk.CTkLabel(frm, text="Output File (.xlsx):")
+        self.row_output_file_entry = ctk.CTkEntry(frm, textvariable=self.output_file_path, width=500)
+        self.row_output_file_browse = ctk.CTkButton(frm, text="Browse…", command=self.browse_output_file)
         if DND_AVAILABLE:
-            try:
-                self.row_output_file_entry.drop_target_register(DND_FILES)
-                self.row_output_file_entry.dnd_bind("<<Drop>>", self._on_drop_output_file)
-            except Exception:
-                pass
+            self._safe_register_dnd(self.row_output_file_entry, self._on_drop_output_file)
 
-        # Row 8: Mapping editors container
-        editors = ttk.Frame(frm)
-        editors.grid(row=8, column=0, columnspan=4, sticky="nsew", **pad)
-
-        # ---- CLIN Mapping Editor ----
-        clin_frame = ttk.LabelFrame(editors, text="CLIN (Contract) Mapping")
-        clin_frame.grid(row=0, column=0, sticky="nsew", **pad)
-        top_clin = ttk.Frame(clin_frame)
-        top_clin.grid(row=0, column=0, sticky="ew", **pad)
-        ttk.Checkbutton(top_clin, text="Apply CLIN mapping", variable=self.use_clin_map).pack(side="left")
-        ttk.Label(top_clin, text="Search:").pack(side="left", padx=(12, 4))
-        ent_clin_search = ttk.Entry(top_clin, textvariable=self.clin_search, width=20)
-        ent_clin_search.pack(side="left")
-
-        self.clin_tree = self._create_selectable_mapping_tree(clin_frame, start_row=1, columns=("✓", "From", "To"))
-        self._seed_clin_defaults()
-        self._refresh_mapping_tree("clin")
-
-        clin_btns = ttk.Frame(clin_frame)
-        clin_btns.grid(row=3, column=0, sticky="w", **pad)
-        ttk.Button(clin_btns, text="Add", command=self.add_clin).pack(side="left", padx=4)
-        ttk.Button(clin_btns, text="Delete", command=self.delete_clin).pack(side="left", padx=4)
-        ttk.Button(clin_btns, text="Select All", command=lambda: self.select_all("clin")).pack(side="left", padx=4)
-        ttk.Button(clin_btns, text="Clear All", command=lambda: self.clear_all("clin")).pack(side="left", padx=4)
-        ttk.Button(clin_btns, text="Import…", command=lambda: self.import_mapping("clin")).pack(side="left", padx=4)
-        ttk.Button(clin_btns, text="Export…", command=lambda: self.export_mapping("clin")).pack(side="left", padx=4)
-
-        # ---- Phase Mapping Editor ----
-        phase_frame = ttk.LabelFrame(editors, text="Phase Mapping")
-        phase_frame.grid(row=0, column=1, sticky="nsew", **pad)
-        top_phase = ttk.Frame(phase_frame)
-        top_phase.grid(row=0, column=0, sticky="ew", **pad)
-        ttk.Checkbutton(top_phase, text="Apply Phase mapping", variable=self.use_phase_map).pack(side="left")
-        ttk.Label(top_phase, text="Search:").pack(side="left", padx=(12, 4))
-        ent_phase_search = ttk.Entry(top_phase, textvariable=self.phase_search, width=20)
-        ent_phase_search.pack(side="left")
-
-        self.phase_tree = self._create_selectable_mapping_tree(phase_frame, start_row=1, columns=("✓", "From (Upper)", "To"))
-        self._seed_phase_defaults()
-        self._refresh_mapping_tree("phase")
-
-        phase_btns = ttk.Frame(phase_frame)
-        phase_btns.grid(row=3, column=0, sticky="w", **pad)
-        ttk.Button(phase_btns, text="Add", command=self.add_phase).pack(side="left", padx=4)
-        ttk.Button(phase_btns, text="Delete", command=self.delete_phase).pack(side="left", padx=4)
-        ttk.Button(phase_btns, text="Select All", command=lambda: self.select_all("phase")).pack(side="left", padx=4)
-        ttk.Button(phase_btns, text="Clear All", command=lambda: self.clear_all("phase")).pack(side="left", padx=4)
-        ttk.Button(phase_btns, text="Import…", command=lambda: self.import_mapping("phase")).pack(side="left", padx=4)
-        ttk.Button(phase_btns, text="Export…", command=lambda: self.export_mapping("phase")).pack(side="left", padx=4)
-
-        # ---- WBS Code Mapping Editor ----
-        wbs_code_frame = ttk.LabelFrame(editors, text="WBS Code Mapping")
-        wbs_code_frame.grid(row=1, column=0, sticky="nsew", **pad)
-        top_wbs_code = ttk.Frame(wbs_code_frame)
-        top_wbs_code.grid(row=0, column=0, sticky="ew", **pad)
-        ttk.Checkbutton(top_wbs_code, text="Apply WBS code mapping", variable=self.use_wbs_code_map).pack(side="left")
-        ttk.Label(top_wbs_code, text="Search:").pack(side="left", padx=(12, 4))
-        ent_wbs_code_search = ttk.Entry(top_wbs_code, textvariable=self.wbs_code_search, width=20)
-        ent_wbs_code_search.pack(side="left")
-
-        self.wbs_code_tree = self._create_selectable_mapping_tree(
-            wbs_code_frame, start_row=1, columns=("✓", "From (WBS Code)", "To (Mapped Code)")
-        )
-        self._seed_wbs_code_defaults()
-        self._refresh_mapping_tree("wbs_code")
-
-        wbs_code_btns = ttk.Frame(wbs_code_frame)
-        wbs_code_btns.grid(row=3, column=0, sticky="w", **pad)
-        ttk.Button(wbs_code_btns, text="Add", command=self.add_wbs_code).pack(side="left", padx=4)
-        ttk.Button(wbs_code_btns, text="Delete", command=self.delete_wbs_code).pack(side="left", padx=4)
-        ttk.Button(wbs_code_btns, text="Select All", command=lambda: self.select_all("wbs_code")).pack(side="left", padx=4)
-        ttk.Button(wbs_code_btns, text="Clear All", command=lambda: self.clear_all("wbs_code")).pack(side="left", padx=4)
-        ttk.Button(wbs_code_btns, text="Import…", command=lambda: self.import_mapping("wbs_code")).pack(side="left", padx=4)
-        ttk.Button(wbs_code_btns, text="Export…", command=lambda: self.export_mapping("wbs_code")).pack(side="left", padx=4)
-
-        # ---- WBS Description Mapping Editor ----
-        wbs_desc_frame = ttk.LabelFrame(editors, text="WBS Description Mapping")
-        wbs_desc_frame.grid(row=1, column=1, sticky="nsew", **pad)
-        top_wbs_desc = ttk.Frame(wbs_desc_frame)
-        top_wbs_desc.grid(row=0, column=0, sticky="ew", **pad)
-        ttk.Checkbutton(top_wbs_desc, text="Apply WBS description mapping", variable=self.use_wbs_desc_map).pack(side="left")
-        ttk.Label(top_wbs_desc, text="Search:").pack(side="left", padx=(12, 4))
-        ent_wbs_desc_search = ttk.Entry(top_wbs_desc, textvariable=self.wbs_desc_search, width=20)
-        ent_wbs_desc_search.pack(side="left")
-
-        self.wbs_desc_tree = self._create_selectable_mapping_tree(
-            wbs_desc_frame, start_row=1, columns=("✓", "From (Upper)", "To (Mapped Description)")
-        )
-        self._seed_wbs_desc_defaults()
-        self._refresh_mapping_tree("wbs_desc")
-
-        # Load user preferences
-        self.load_config()
-
-        wbs_desc_btns = ttk.Frame(wbs_desc_frame)
-        wbs_desc_btns.grid(row=3, column=0, sticky="w", **pad)
-        ttk.Button(wbs_desc_btns, text="Add", command=self.add_wbs_desc).pack(side="left", padx=4)
-        ttk.Button(wbs_desc_btns, text="Delete", command=self.delete_wbs_desc).pack(side="left", padx=4)
-        ttk.Button(wbs_desc_btns, text="Select All", command=lambda: self.select_all("wbs_desc")).pack(side="left", padx=4)
-        ttk.Button(wbs_desc_btns, text="Clear All", command=lambda: self.clear_all("wbs_desc")).pack(side="left", padx=4)
-        ttk.Button(wbs_desc_btns, text="Import…", command=lambda: self.import_mapping("wbs_desc")).pack(side="left", padx=4)
-        ttk.Button(wbs_desc_btns, text="Export…", command=lambda: self.export_mapping("wbs_desc")).pack(side="left", padx=4)
-
-        # Row 9: Run button
-        self.btn_run = ttk.Button(frm, text="Run", command=self.run_clicked)
-        self.btn_run.grid(row=9, column=1, sticky="w", **pad)
-        self.btn_save = ttk.Button(frm, text="Save Preferences", command=self.save_preferences)
-        self.btn_save.grid(row=9, column=2, **pad)
-        self.btn_reset = ttk.Button(frm, text="Reset to Defaults", command=self.reset_to_defaults)
-        self.btn_reset.grid(row=9, column=3, **pad)
-
-        # Row 10: Status
-        ttk.Label(frm, text="Status:").grid(row=10, column=0, sticky="nw", **pad)
-        from tkinter import Text
-        self.status_box = Text(frm, height=10, width=90, wrap="word")
-        self.status_box.grid(row=10, column=1, columnspan=3, sticky="nsew", **pad)
-
-        # Expandable layout inside the scrollable frame
+        # ---------------- Mapping Editors (Accordion) ----------------
+        editors = ctk.CTkFrame(frm)
+        editors.grid(row=8, column=0, columnspan=4, sticky="nsew", padx=8, pady=8)
         frm.columnconfigure(1, weight=1)
         frm.rowconfigure(10, weight=1)
         editors.columnconfigure(0, weight=1)
-        editors.columnconfigure(1, weight=1)
+        editors.rowconfigure(0, weight=1)
+
+        # ---- CLIN Mapping ----
+        self.acc_clin = AccordionSection(editors, "CLIN (Contract) Mapping")
+        self.acc_clin.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        top_clin = ctk.CTkFrame(self.acc_clin.content)
+        top_clin.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkCheckBox(top_clin, text="Apply CLIN mapping", variable=self.use_clin_map).pack(side="left")
+        ctk.CTkLabel(top_clin, text="Search:").pack(side="left", padx=(12, 4))
+        ctk.CTkEntry(top_clin, textvariable=self.clin_search, width=180).pack(side="left")
+
+        self.clin_tree = self._create_selectable_mapping_tree(self.acc_clin.content, start_row=1, columns=("✓", "From", "To"))
+        self._styler.style_tree(self.clin_tree)
+        self._seed_clin_defaults()
+        self._refresh_mapping_tree("clin")
+
+        clin_btns = ctk.CTkFrame(self.acc_clin.content)
+        clin_btns.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ctk.CTkButton(clin_btns, text="Add", command=self.add_clin).pack(side="left", padx=4)
+        ctk.CTkButton(clin_btns, text="Delete", command=self.delete_clin).pack(side="left", padx=4)
+        ctk.CTkButton(clin_btns, text="Select All", command=lambda: self.select_all("clin")).pack(side="left", padx=4)
+        ctk.CTkButton(clin_btns, text="Clear All", command=lambda: self.clear_all("clin")).pack(side="left", padx=4)
+        ctk.CTkButton(clin_btns, text="Import…", command=lambda: self.import_mapping("clin")).pack(side="left", padx=4)
+        ctk.CTkButton(clin_btns, text="Export…", command=lambda: self.export_mapping("clin")).pack(side="left", padx=4)
+
+        # ---- Phase Mapping ----
+        self.acc_phase = AccordionSection(editors, "Phase Mapping")
+        self.acc_phase.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        top_phase = ctk.CTkFrame(self.acc_phase.content)
+        top_phase.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkCheckBox(top_phase, text="Apply Phase mapping", variable=self.use_phase_map).pack(side="left")
+        ctk.CTkLabel(top_phase, text="Search:").pack(side="left", padx=(12, 4))
+        ctk.CTkEntry(top_phase, textvariable=self.phase_search, width=180).pack(side="left")
+
+        self.phase_tree = self._create_selectable_mapping_tree(self.acc_phase.content, start_row=1, columns=("✓", "From (Upper)", "To"))
+        self._styler.style_tree(self.phase_tree)
+        self._seed_phase_defaults()
+        self._refresh_mapping_tree("phase")
+
+        phase_btns = ctk.CTkFrame(self.acc_phase.content)
+        phase_btns.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ctk.CTkButton(phase_btns, text="Add", command=self.add_phase).pack(side="left", padx=4)
+        ctk.CTkButton(phase_btns, text="Delete", command=self.delete_phase).pack(side="left", padx=4)
+        ctk.CTkButton(phase_btns, text="Select All", command=lambda: self.select_all("phase")).pack(side="left", padx=4)
+        ctk.CTkButton(phase_btns, text="Clear All", command=lambda: self.clear_all("phase")).pack(side="left", padx=4)
+        ctk.CTkButton(phase_btns, text="Import…", command=lambda: self.import_mapping("phase")).pack(side="left", padx=4)
+        ctk.CTkButton(phase_btns, text="Export…", command=lambda: self.export_mapping("phase")).pack(side="left", padx=4)
+
+        # ---- WBS Code Mapping ----
+        self.acc_wbs_code = AccordionSection(editors, "WBS Code Mapping")
+        self.acc_wbs_code.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        top_wbs_code = ctk.CTkFrame(self.acc_wbs_code.content)
+        top_wbs_code.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkCheckBox(top_wbs_code, text="Apply WBS code mapping", variable=self.use_wbs_code_map).pack(side="left")
+        ctk.CTkLabel(top_wbs_code, text="Search:").pack(side="left", padx=(12, 4))
+        ctk.CTkEntry(top_wbs_code, textvariable=self.wbs_code_search, width=180).pack(side="left")
+
+        self.wbs_code_tree = self._create_selectable_mapping_tree(self.acc_wbs_code.content, start_row=1, columns=("✓", "From (WBS Code)", "To (Mapped Code)"))
+        self._styler.style_tree(self.wbs_code_tree)
+        self._seed_wbs_code_defaults()
+        self._refresh_mapping_tree("wbs_code")
+
+        wbs_code_btns = ctk.CTkFrame(self.acc_wbs_code.content)
+        wbs_code_btns.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ctk.CTkButton(wbs_code_btns, text="Add", command=self.add_wbs_code).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_code_btns, text="Delete", command=self.delete_wbs_code).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_code_btns, text="Select All", command=lambda: self.select_all("wbs_code")).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_code_btns, text="Clear All", command=lambda: self.clear_all("wbs_code")).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_code_btns, text="Import…", command=lambda: self.import_mapping("wbs_code")).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_code_btns, text="Export…", command=lambda: self.export_mapping("wbs_code")).pack(side="left", padx=4)
+
+        # ---- WBS Description Mapping ----
+        self.acc_wbs_desc = AccordionSection(editors, "WBS Description Mapping")
+        self.acc_wbs_desc.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
+        top_wbs_desc = ctk.CTkFrame(self.acc_wbs_desc.content)
+        top_wbs_desc.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ctk.CTkCheckBox(top_wbs_desc, text="Apply WBS description mapping", variable=self.use_wbs_desc_map).pack(side="left")
+        ctk.CTkLabel(top_wbs_desc, text="Search:").pack(side="left", padx=(12, 4))
+        ctk.CTkEntry(top_wbs_desc, textvariable=self.wbs_desc_search, width=180).pack(side="left")
+
+        self.wbs_desc_tree = self._create_selectable_mapping_tree(self.acc_wbs_desc.content, start_row=1, columns=("✓", "From (Upper)", "To (Mapped Description)"))
+        self._styler.style_tree(self.wbs_desc_tree)
+        self._seed_wbs_desc_defaults()
+        self._refresh_mapping_tree("wbs_desc")
+
+        wbs_desc_btns = ctk.CTkFrame(self.acc_wbs_desc.content)
+        wbs_desc_btns.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        ctk.CTkButton(wbs_desc_btns, text="Add", command=self.add_wbs_desc).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_desc_btns, text="Delete", command=self.delete_wbs_desc).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_desc_btns, text="Select All", command=lambda: self.select_all("wbs_desc")).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_desc_btns, text="Clear All", command=lambda: self.clear_all("wbs_desc")).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_desc_btns, text="Import…", command=lambda: self.import_mapping("wbs_desc")).pack(side="left", padx=4)
+        ctk.CTkButton(wbs_desc_btns, text="Export…", command=lambda: self.export_mapping("wbs_desc")).pack(side="left", padx=4)
+
+        # --- Load user preferences (after trees created) ---
+        self.load_config()
+
+        # --- Actions ---
+        actions = ctk.CTkFrame(frm)
+        actions.grid(row=9, column=0, columnspan=4, sticky="ew", padx=8, pady=8)
+        self.btn_run = ctk.CTkButton(actions, text="Run", command=self.run_clicked)
+        self.btn_run.pack(side="left", padx=6)
+        self.btn_save = ctk.CTkButton(actions, text="Save Preferences", command=self.save_preferences)
+        self.btn_save.pack(side="left", padx=6)
+        self.btn_reset = ctk.CTkButton(actions, text="Reset to Defaults", command=self.reset_to_defaults)
+        self.btn_reset.pack(side="left", padx=6)
+
+        # --- Status ---
+        ctk.CTkLabel(frm, text="Status:").grid(row=10, column=0, sticky="nw", padx=8, pady=6)
+        self.status_box = ctk.CTkTextbox(frm, height=200, width=700)
+        self.status_box.grid(row=10, column=1, columnspan=3, sticky="nsew", padx=8, pady=6)
+
+        # Expandable layout
+        for col in (0, 1, 2, 3):
+            frm.columnconfigure(col, weight=(1 if col == 1 else 0))
+        frm.rowconfigure(10, weight=1)
 
         # Search live filters
         self.clin_search.trace_add("write", lambda *_: self._refresh_mapping_tree("clin"))
@@ -848,15 +917,34 @@ class ChargeCodesGUI:
         # Init output mode UI
         self._on_output_mode_change()
 
+    # ---------- Appearance ----------
+    def _on_theme_change(self, mode: str):
+        try:
+            ctk.set_appearance_mode(mode)
+        except Exception:
+            pass
+        # Reapply ttk styles so Treeviews & Scrollbars match new mode
+        self._styler.apply()
+        # Explicitly restyle all trees (useful if new Style objects)
+        for tree in (self.clin_tree, self.phase_tree, self.wbs_code_tree, self.wbs_desc_tree):
+            self._styler.style_tree(tree)
+
     # ---------- Drag & Drop handlers ----------
+    def _safe_register_dnd(self, widget, drop_callback):
+        """Attempt to register DnD on widget; fallback silently if not possible."""
+        if not DND_AVAILABLE:
+            return
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", drop_callback)
+        except Exception:
+            # Some CustomTkinter widgets may not expose dnd methods; ignore gracefully.
+            pass
+
     def _normalize_dropped_paths(self, data: str):
-        """
-        Convert tkdnd drop data to a list of paths (handles braces & spaces).
-        """
+        """Convert tkdnd drop data to a list of paths (handles braces & spaces)."""
         data = data.strip()
-        paths = []
-        buf = ""
-        brace = False
+        paths, buf, brace = [], "", False
         for ch in data:
             if ch == "{":
                 brace = True
@@ -877,16 +965,11 @@ class ChargeCodesGUI:
         return paths
 
     def _on_drop_input(self, event):
-        """Handle drop data; take the first path."""
         paths = self._normalize_dropped_paths(event.data)
         if paths:
             self.input_path.set(paths[0])
 
     def _on_drop_output_folder(self, event):
-        """
-        Handle DnD onto Output Folder entry.
-        Accepts a folder; if a file is dropped, uses its parent folder.
-        """
         paths = self._normalize_dropped_paths(event.data)
         if not paths:
             return
@@ -897,24 +980,17 @@ class ChargeCodesGUI:
             self.output_dir.set(str(p))
 
     def _on_drop_output_file(self, event):
-        """
-        Handle DnD onto Output File entry (single file mode).
-        Accepts a file or a folder; enforces .xlsx extension.
-        """
         paths = self._normalize_dropped_paths(event.data)
         if not paths:
             return
         p = pathlib.Path(paths[0])
         if p.is_dir():
-            # If a folder is dropped, construct a file path using current filename (or default)
             fname = self._sanitize_filename(self.output_filename.get().strip() or "Charge_Codes")
             fp = (p / fname).with_suffix(".xlsx")
             self.output_file_path.set(str(fp))
             return
-        # If a file is dropped, enforce .xlsx
         if p.suffix.lower() != ".xlsx":
             p = p.with_suffix(".xlsx")
-        # Ensure parent exists
         if p.parent.exists():
             self.output_file_path.set(str(p))
         else:
@@ -925,12 +1001,12 @@ class ChargeCodesGUI:
         editor = ContractTypesEditor(self.root, self.contract_options)
         if editor.result is not None:
             self.contract_options = editor.result
-            self.contract_combo["values"] = self.contract_options
+            self.contract_combo.configure(values=self.contract_options)
             current = self.contract_type.get()
             if current in self.contract_options:
                 self.contract_combo.set(current)
             elif self.contract_options:
-                self.contract_combo.current(0)
+                self.contract_combo.set(self.contract_options[0])
 
     def _parse_contract_code(self, selected_text):
         """Parse 'code: label' -> 'code'. If no colon, return as-is."""
@@ -944,59 +1020,49 @@ class ChargeCodesGUI:
     def _on_output_mode_change(self):
         mode = self.output_mode.get()
         if mode == "folder":
-            # Show folder+filename
             self.row_output_folder_label.grid()
             self.row_output_folder_entry.grid()
-            self.row_output_folder_browse.grid()
             self.row_output_name_label.grid()
             self.row_output_name_entry.grid()
-            # Hide file path controls
             self.row_output_file_label.grid_remove()
             self.row_output_file_entry.grid_remove()
             self.row_output_file_browse.grid_remove()
         else:
-            # Hide folder+filename
             self.row_output_folder_label.grid_remove()
             self.row_output_folder_entry.grid_remove()
-            self.row_output_folder_browse.grid_remove()
             self.row_output_name_label.grid_remove()
             self.row_output_name_entry.grid_remove()
-            # Show file path controls
             self.row_output_file_label.grid(row=7, column=0, sticky="w", padx=8, pady=6)
             self.row_output_file_entry.grid(row=7, column=1, sticky="ew", padx=8, pady=6)
             self.row_output_file_browse.grid(row=7, column=2, padx=8, pady=6)
-            if DND_AVAILABLE:
-                try:
-                    self.row_output_file_entry.drop_target_register(DND_FILES)
-                    self.row_output_file_entry.dnd_bind("<<Drop>>", self._on_drop_output_file)
-                except Exception:
-                    pass
+            self._safe_register_dnd(self.row_output_file_entry, self._on_drop_output_file)
 
-    # ---------- Tree creation with centered columns & both scrollbars ----------
+    # ---------- Tree creation with scrollbars ----------
     def _create_selectable_mapping_tree(self, parent, start_row=0, columns=("✓", "From", "To")):
-        tree = ttk.Treeview(parent, columns=columns, show="headings", height=10)
+        tree_container = ctk.CTkFrame(parent)
+        tree_container.grid(row=start_row, column=0, sticky="nsew", padx=4, pady=4)
+
+        tree = ttk.Treeview(tree_container, columns=columns, show="headings", height=10)
         for idx, col in enumerate(columns):
             tree.heading(col, text=col)
-            width = 120 if idx == 0 else 240
-            tree.column(col, width=width, anchor="center")  # center content
-        tree.grid(row=start_row, column=0, sticky="nsew")
+            width = 120 if idx == 0 else 260
+            tree.column(col, width=width, anchor="center")
+        tree.grid(row=0, column=0, sticky="nsew")
 
-        yscroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
-        yscroll.grid(row=start_row, column=1, sticky="ns")
+        yscroll = ttk.Scrollbar(tree_container, orient="vertical", command=tree.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
-        xscroll.grid(row=start_row + 1, column=0, sticky="ew")
+        xscroll.grid(row=start_row + 1, column=0, sticky="ew", padx=4, pady=(0, 4))
 
         tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        tree_container.columnconfigure(0, weight=1)
+        tree_container.rowconfigure(0, weight=1)
         parent.rowconfigure(start_row, weight=1)
         parent.columnconfigure(0, weight=1)
         return tree
 
     # ---------- Mapping data management ----------
     def _seed_clin_defaults(self):
-        """
-        Seed CLIN defaults, including a special rule entry that users can toggle:
-        - SPECIAL_CLIN_PAD_KEY: when selected, enables left-padding CLIN to 6 chars.
-        """
         self.clin_data = [
             {"selected": False, "from": self.SPECIAL_CLIN_PAD_KEY, "to": "Add chars until 6 chars"},
         ]
@@ -1062,7 +1128,7 @@ class ChargeCodesGUI:
                 else:
                     from_display = row["from"]
                     to_display = row["to"]
-            iid = tree.insert("", END, values=(mark, from_display, to_display))
+            iid = tree.insert("", tk.END, values=(mark, from_display, to_display))
             tree._row_refs[iid] = row
 
     def _on_tree_click(self, event, which):
@@ -1378,17 +1444,12 @@ class ChargeCodesGUI:
 
     # ---------- Helpers to read flags & dicts ----------
     def _clin_pad_enabled(self) -> bool:
-        """Return True if the special CLIN padding rule is selected."""
         for r in self.clin_data:
             if r["from"] == self.SPECIAL_CLIN_PAD_KEY and r["selected"]:
                 return True
         return False
 
     def _build_mapping_dict(self, which):
-        """
-        Build mapping dict using ONLY rows with selected=True.
-        Keys uppercased for 'phase' and 'wbs_desc' (case-insensitive matching).
-        """
         src = {
             "clin": self.clin_data,
             "phase": self.phase_data,
@@ -1406,8 +1467,12 @@ class ChargeCodesGUI:
 
     # ---------- IO helpers ----------
     def log(self, msg):
-        self.status_box.insert(END, msg + "\n")
-        self.status_box.see(END)
+        try:
+            self.status_box.insert("end", msg + "\n")
+            self.status_box.see("end")
+        except Exception:
+            # Fallback to stdout if textbox isn't ready
+            print(msg)
 
     def browse_input_file(self):
         path = filedialog.askopenfilename(
@@ -1446,7 +1511,7 @@ class ChargeCodesGUI:
             self.output_file_path.set(str(p))
 
     def _sanitize_filename(self, name: str) -> str:
-        sanitized = re.sub(r'[\<\>:"/\\\|\?\*]+', "_", name).strip()
+        sanitized = re.sub(r'[<>:"/\\|\?*]+', "_", name).strip()
         return sanitized or "Charge_Codes"
 
     def _final_output_path(self) -> pathlib.Path:
@@ -1522,14 +1587,17 @@ class ChargeCodesGUI:
 
     def run_clicked(self):
         errs = self.validate()
-        self.status_box.delete(1.0, END)
+        try:
+            self.status_box.delete("1.0", "end")
+        except Exception:
+            pass
         if errs:
             for e in errs:
                 self.log(f"❌ {e}")
             messagebox.showerror("Validation Error", "\n".join(errs))
             return
 
-        self.btn_run.config(state="disabled")
+        self.btn_run.configure(state="disabled")
         self.log("▶ Starting…")
         t = threading.Thread(target=self._do_work, daemon=True)
         t.start()
@@ -1591,7 +1659,10 @@ class ChargeCodesGUI:
             self.log("❌ Error occurred:\n" + err_text)
             messagebox.showerror("Error", f"An error occurred:\n\n{ex}\n\nSee status for details.")
         finally:
-            self.btn_run.config(state="normal")
+            try:
+                self.btn_run.configure(state="normal")
+            except Exception:
+                pass
 
     def load_config(self):
         if not self.config_path.exists():
@@ -1620,7 +1691,9 @@ class ChargeCodesGUI:
             # Load contract options
             if 'contract_options' in config:
                 self.contract_options = config['contract_options']
-                self.contract_combo['values'] = self.contract_options
+                self.contract_combo.configure(values=self.contract_options)
+                if self.contract_options:
+                    self.contract_combo.set(self.contract_options[0])
             # Refresh trees
             self._refresh_mapping_tree("clin")
             self._refresh_mapping_tree("phase")
@@ -1652,42 +1725,42 @@ class ChargeCodesGUI:
     def reset_to_defaults(self):
         if not messagebox.askyesno("Reset", "Reset all mappings and settings to defaults? This cannot be undone."):
             return
-        # Reset mappings
         self._seed_clin_defaults()
         self._seed_phase_defaults()
         self._seed_wbs_code_defaults()
         self._seed_wbs_desc_defaults()
-        # Reset toggles
         self.use_clin_map.set(True)
         self.use_phase_map.set(True)
         self.use_wbs_code_map.set(True)
         self.use_wbs_desc_map.set(True)
-        # Reset contract options
         self.contract_options = ["1: FFP", "2: CRNF"]
-        self.contract_combo['values'] = self.contract_options
+        self.contract_combo.configure(values=self.contract_options)
         if self.contract_options:
-            self.contract_combo.current(0)
-        # Refresh trees
+            self.contract_combo.set(self.contract_options[0])
         self._refresh_mapping_tree("clin")
         self._refresh_mapping_tree("phase")
         self._refresh_mapping_tree("wbs_code")
         self._refresh_mapping_tree("wbs_desc")
         messagebox.showinfo("Reset", "Reset to defaults completed.")
 
+# --- Root creation with DnD + CTk theme ---
 def main_gui():
-    root = TkRootClass()
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        elif "clam" in style.theme_names():
-            style.theme_use("clam")
-    except Exception:
-        pass
-    app = ChargeCodesGUI(root)
+    # Ensure we always have a CTk root, even with TkinterDnD
+    if DND_AVAILABLE:
+        # Hybrid root so CTk theme works and DnD is available
+        class CTkDnD(ctk.CTk, TkinterDnD.Tk):
+            def __init__(self, *args, **kwargs):
+                ctk.CTk.__init__(self, *args, **kwargs)
+                TkinterDnD.Tk.__init__(self, *args, **kwargs)
+        root = CTkDnD()
+    else:
+        root = ctk.CTk()
+
     root.geometry("1180x900")
-    root.minsize(800, 600)  # ensure reasonable minimum while scroll handles overflow
+    root.minsize(900, 650)
+    app = ChargeCodesGUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main_gui()
