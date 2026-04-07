@@ -1744,10 +1744,11 @@ class ChargeCodesGUI:
         messagebox.showinfo("Reset", "Reset to defaults completed.")
 
 # --- Root creation with DnD + CTk theme ---
+
+
 def main_gui():
-    # Ensure we always have a CTk root, even with TkinterDnD
+    # --- Create root (your existing logic) ---
     if DND_AVAILABLE:
-        # Hybrid root so CTk theme works and DnD is available
         class CTkDnD(ctk.CTk, TkinterDnD.Tk):
             def __init__(self, *args, **kwargs):
                 ctk.CTk.__init__(self, *args, **kwargs)
@@ -1758,8 +1759,25 @@ def main_gui():
 
     root.geometry("1180x900")
     root.minsize(900, 650)
+
+    # --- Close handler: only run when user clicks X ---
+    def on_close():
+        # If you ever add non-daemon threads, signal them to stop here.
+        # e.g., set a flag/event, join them with a short timeout, etc.
+        try:
+            root.quit()     # exit mainloop
+        finally:
+            root.destroy()  # destroy windows
+
+    # Register the handler (NOTICE: no parentheses)
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
     app = ChargeCodesGUI(root)
     root.mainloop()
+
+    # Optional: hard-exit after the GUI loop ends
+    # (useful to guarantee the interpreter exits)
+
 
 
 if __name__ == "__main__":
