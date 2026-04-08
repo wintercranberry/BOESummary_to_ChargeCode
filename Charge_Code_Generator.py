@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Charge Code Generator GUI (CustomTkinter + Accordion) — Version 2.1.0
+Charge Code Generator GUI (CustomTkinter + Accordion) — Version 2.2.0
+
+Changes in v2.2.0:
+- New optional input columns supported: Start Date, End Date, OBS, REC/NRE, Cost Type (case-insensitive, flexible matching).
+- Level 2 (Contract Type) is numeric-only and determined per row:
+  • If Cost Type matches a Contract Types label (e.g., 'FFP' → '1', 'CRNF' → '2'), use the mapped numeric code.
+  • If Cost Type is numeric (e.g., '2'), use that number.
+  • Otherwise, default to the user-selected Contract Type (numeric code).
+- Metadata columns are carried forward on full hierarchy rows, blank on partial parent rows.
 
 Theme fixes:
 - Root is always a CustomTkinter window—even with tkinterdnd2 (DnD)—via CTkDnD hybrid class.
@@ -59,7 +67,7 @@ except Exception:
     DND_AVAILABLE = False
 
 # --------------------------
-# Core logic (unchanged)
+# Core logic
 # --------------------------
 
 def _find_column(df, keywords):
@@ -188,8 +196,13 @@ def build_paths(
     enable_clin_map=True, enable_phase_map=True,
     enable_wbs_code_map=True, enable_wbs_desc_map=True,
     pad_clin_to_6=False,
+    contract_label_to_code=None,  # NEW: mapping "FFP"->"1", etc.
 ):
-    """Build full paths (Level1..Level5) from the BOE Summary; include WBS Description; sort & de-duplicate."""
+    """
+    Build full paths (Level1..Level5) from the BOE Summary; include WBS Description & new metadata; sort & de-duplicate.
+    Level 2 is dictated *per row* by 'Cost Type' (if present); otherwise defaults to user-selected contract_type (numeric).
+    """
+    # Required base columns:
     clin_col = _find_column(df, ["clin"])
     wbs_col = _find_column(df, ["wbs"])
     phase_col = _find_column(df, ["phase"])
@@ -197,8 +210,28 @@ def build_paths(
     if missing:
         raise ValueError(f"Missing columns: {', '.join(missing)}. Found: {list(df.columns)}")
 
+    # Optional new columns (flexible matching, case-insensitive)
+    start_col = _find_column(df, [
+        "start date", "start", "start_dt", "startdate", "start-date",
+        "period start", "start of period", "begin date", "begin"
+    ])
+    end_col   = _find_column(df, [
+        "end date", "end", "end_dt", "enddate", "end-date",
+        "finish date", "finish", "period end", "end of period"
+    ])
+    obs_col   = _find_column(df, [
+        "obs", "organizational breakdown structure", "org breakdown", "org", "org code", "obs code", "obs id"
+    ])
+    recnre_col = _find_column(df, [
+        "rec/nre", "rec nre", "recnre", "rec", "nre", "recurring", "non-recurring", "recurring/nonrecurring"
+    ])
+    costtype_col = _find_column(df, [
+        "cost type", "costtype", "cost-type", "contract type", "ctype", "contract type per row"
+    ])
+
     rows = []
     for _, r in df.iterrows():
+        # Existing level extraction / mapping:
         level3 = _extract_clin(
             r.get(clin_col),
             clin_map=clin_map,
@@ -216,7 +249,33 @@ def build_paths(
             continue
 
         level1 = str(project_number).strip()
-        level2 = str(contract_type).strip() if contract_type else "1"
+
+        # --- Level 2 (numeric-only): choose via Cost Type when possible; otherwise fallback to user-selected numeric code ---
+        level2_default = str(contract_type).strip() if contract_type else "1"
+        level2 = level2_default
+        if costtype_col is not None:
+            ct_raw = r.get(costtype_col)
+            if ct_raw is not None:
+                ct = str(ct_raw).strip()
+                if ct:
+                    # Try mapping label -> code (e.g., "FFP" -> "1", "CRNF" -> "2")
+                    key = ct.upper()
+                    if contract_label_to_code and key in contract_label_to_code:
+                        level2 = contract_label_to_code[key]
+                    elif re.fullmatch(r"\d+", ct):
+                        # If it's a number string (e.g., "2"), use it directly
+                        level2 = ct
+                    else:
+                        # Unrecognized label -> keep default numeric code
+                        level2 = level2_default
+
+        # --- gather optional metadata ---
+        start_date = str(r.get(start_col)).strip() if start_col is not None and r.get(start_col) is not None else ""
+        end_date   = str(r.get(end_col)).strip()   if end_col   is not None and r.get(end_col)   is not None else ""
+        obs_val    = str(r.get(obs_col)).strip()   if obs_col   is not None and r.get(obs_col)   is not None else ""
+        recnre_val = str(r.get(recnre_col)).strip()if recnre_col is not None and r.get(recnre_col) is not None else ""
+        cost_type  = str(r.get(costtype_col)).strip() if costtype_col is not None and r.get(costtype_col) is not None else ""
+
         rows.append({
             "Level 1": level1,
             "Level 2": level2,
@@ -224,6 +283,12 @@ def build_paths(
             "Level 4": level4,
             "Level 5": level5,
             "WBS Description": wbs_desc_final or "",
+            # NEW metadata columns in the base paths frame:
+            "Start Date": start_date,
+            "End Date": end_date,
+            "OBS": obs_val,
+            "REC/NRE": recnre_val,
+            "Cost Type": cost_type,
         })
 
     if not rows:
@@ -236,16 +301,20 @@ def build_paths(
 def expand_hierarchy(paths):
     """
     Expand sorted full paths into hierarchical rows with partial parent lines and full lines.
-    Adds 'WBS Description' column (blank on partial rows, populated on full rows).
+    Adds WBS Description and new metadata columns; metadata is blank on partial rows, populated on full rows.
     """
     out = []
     last = {"Level 1": None, "Level 2": None, "Level 3": None, "Level 4": None, "Level 5": None}
+
+    metadata_cols = ["WBS Description", "Start Date", "End Date", "OBS", "REC/NRE", "Cost Type"]
 
     def _row(levels_present, paths_row):
         vals = {lvl: paths_row[lvl] if lvl in levels_present else "" for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]}
         parts = [paths_row[lvl] for lvl in levels_present]
         vals["Charge String"] = ".".join(parts) + "."
-        vals["WBS Description"] = ""
+        # metadata blank for partial rows:
+        for mc in metadata_cols:
+            vals[mc] = ""
         return vals
 
     for _, paths_row in paths.iterrows():
@@ -271,7 +340,9 @@ def expand_hierarchy(paths):
 
         full_vals = {lvl: paths_row[lvl] for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]}
         full_vals["Charge String"] = ".".join([paths_row[lvl] for lvl in ["Level 1", "Level 2", "Level 3", "Level 4", "Level 5"]])
-        full_vals["WBS Description"] = paths_row.get("WBS Description", "")
+        # metadata populated for full row:
+        for mc in metadata_cols:
+            full_vals[mc] = paths_row.get(mc, "")
         out.append(full_vals)
         last["Level 5"] = paths_row["Level 5"]
 
@@ -660,7 +731,7 @@ class ChargeCodesGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Charge Code Generator (BOE Summary → Hierarchy) — v2.1.0")
+        self.root.title("Charge Code Generator (BOE Summary → Hierarchy) — v2.2.0")
 
         # Theme & scaling
         ctk.set_appearance_mode("System")  # "Light", "Dark", or "System"
@@ -741,7 +812,7 @@ class ChargeCodesGUI:
         ctk.CTkEntry(frm, textvariable=self.project_number, width=240).grid(row=2, column=1, sticky="w", padx=8, pady=6)
 
         # --- Contract Type ---
-        ctk.CTkLabel(frm, text="Contract Type (Level 2):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ctk.CTkLabel(frm, text="Contract Type (Level 2 default):").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         self.contract_combo = ctk.CTkComboBox(frm, values=self.contract_options, variable=self.contract_type, width=240)
         self.contract_combo.grid(row=3, column=1, sticky="w", padx=8, pady=6)
         if self.contract_options:
@@ -1016,6 +1087,22 @@ class ChargeCodesGUI:
             return code.strip()
         return s
 
+    def _contract_label_to_code_map(self):
+        """
+        Build a {LABEL_UPPER: CODE} map from self.contract_options that look like 'CODE: LABEL'.
+        Example: ['1: FFP', '2: CRNF'] -> {'FFP': '1', 'CRNF': '2'}
+        """
+        out = {}
+        for item in self.contract_options:
+            s = str(item).strip()
+            if ":" in s:
+                code, label = s.split(":", 1)
+                code = code.strip()
+                label = label.strip()
+                if label:
+                    out[label.upper()] = code
+        return out
+
     # ---------- Output mode UI ----------
     def _on_output_mode_change(self):
         mode = self.output_mode.get()
@@ -1147,7 +1234,7 @@ class ChargeCodesGUI:
         iid = tree.identify_row(event.y)
         if not iid:
             return
-        row = tree._row_refs.get(iid)
+        row = getattr(tree, "_row_refs", {}).get(iid)
         if not row:
             return
         row["selected"] = not row["selected"]
@@ -1511,7 +1598,7 @@ class ChargeCodesGUI:
             self.output_file_path.set(str(p))
 
     def _sanitize_filename(self, name: str) -> str:
-        sanitized = re.sub(r'[<>:"/\\|\?*]+', "_", name).strip()
+        sanitized = re.sub(r'[<>:"/\\|?*]+', "_", name).strip()
         return sanitized or "Charge_Codes"
 
     def _final_output_path(self) -> pathlib.Path:
@@ -1555,7 +1642,7 @@ class ChargeCodesGUI:
         if not proj:
             errs.append("Project Number (Level 1) is required.")
         if not sel:
-            errs.append("Contract Type (Level 2) is required.")
+            errs.append("Contract Type (Level 2 default) is required.")
 
         if mode == "folder":
             out_dir = self.output_dir.get().strip()
@@ -1624,6 +1711,9 @@ class ChargeCodesGUI:
             # Rule flag from CLIN mapping UI
             pad_clin_to_6 = self._clin_pad_enabled()
 
+            # Build {LABEL_UPPER: CODE} mapping for Cost Type -> Level 2
+            contract_label_to_code = self._contract_label_to_code_map()
+
             self.log(f"Loading input from: {in_path}")
             df_boe = read_boe_summary_multi(in_path)
 
@@ -1631,7 +1721,7 @@ class ChargeCodesGUI:
             paths = build_paths(
                 df_boe,
                 project_number=proj,
-                contract_type=ctype,
+                contract_type=ctype,  # default numeric code when Cost Type missing/unrecognized
                 clin_map=clin_map,
                 phase_map=phase_map,
                 wbs_code_map=wbs_code_map,
@@ -1641,6 +1731,7 @@ class ChargeCodesGUI:
                 enable_wbs_code_map=enable_wbs_code,
                 enable_wbs_desc_map=enable_wbs_desc,
                 pad_clin_to_6=pad_clin_to_6,
+                contract_label_to_code=contract_label_to_code,  # NEW
             )
 
             self.log("Expanding hierarchy…")
@@ -1745,9 +1836,8 @@ class ChargeCodesGUI:
 
 # --- Root creation with DnD + CTk theme ---
 
-
 def main_gui():
-    # --- Create root (your existing logic) ---
+    # --- Create root (CTk + optional DnD) ---
     if DND_AVAILABLE:
         class CTkDnD(ctk.CTk, TkinterDnD.Tk):
             def __init__(self, *args, **kwargs):
@@ -1762,23 +1852,15 @@ def main_gui():
 
     # --- Close handler: only run when user clicks X ---
     def on_close():
-        # If you ever add non-daemon threads, signal them to stop here.
-        # e.g., set a flag/event, join them with a short timeout, etc.
         try:
             root.quit()     # exit mainloop
         finally:
             root.destroy()  # destroy windows
 
-    # Register the handler (NOTICE: no parentheses)
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     app = ChargeCodesGUI(root)
     root.mainloop()
-
-    # Optional: hard-exit after the GUI loop ends
-    # (useful to guarantee the interpreter exits)
-
-
 
 if __name__ == "__main__":
     main_gui()
