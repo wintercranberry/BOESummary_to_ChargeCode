@@ -500,7 +500,7 @@ class MappingDialog(ctk.CTkToplevel):
         self.destroy()
 
 class ContractTypesEditor(ctk.CTkToplevel):
-    """Modal editor for Contract Type list: items like '1: FFP', '2: CRNF'."""
+    """Modal editor for Contract Type list: items like '1: FFP', '2: FPI', '3: CPFF', '4: CPIF' """
     def __init__(self, parent, contract_items):
         super().__init__(parent)
         self.title("Edit Contract Types (Level 2)")
@@ -759,7 +759,7 @@ class ChargeCodesGUI:
         self.output_file_path = tk.StringVar()
 
         # Level 2 defaults
-        self.contract_options = ["1: FFP", "2: CRNF"]
+        self.contract_options = ["1: FFP", "2: FPI", "3: CPFF", "4: CPIF", "5: FPAF", "7: T&M", "8: CPAF"]
 
         # Mapping toggles
         self.use_clin_map = tk.BooleanVar(value=True)
@@ -1159,13 +1159,13 @@ class ChargeCodesGUI:
             {"selected": True, "from": "BID", "to": "1BID"},
             {"selected": True, "from": "LOE", "to": "ZLOE"},
             {"selected": True, "from": "RAV", "to": "ZRAV"},
-            {"selected": True, "from": "PDV", "to": "ZPDR"},
-            {"selected": True, "from": "DDV", "to": "ZCDR"},
+            {"selected": True, "from": "PDV", "to": "ZPDV"},
+            {"selected": True, "from": "DDV", "to": "ZDDV"},
             {"selected": True, "from": "COD", "to": "ZCOD"},
             {"selected": True, "from": "HSI", "to": "ZHSI"},
             {"selected": True, "from": "CVT", "to": "ZCVT"},
             {"selected": True, "from": "GAT", "to": "ZGAT"},
-            {"selected": True, "from": "PROD", "to": "ZPROD"},
+            {"selected": True, "from": "PROD", "to": "PROD"},
         ]
 
     def _seed_wbs_code_defaults(self):
@@ -1824,7 +1824,7 @@ class ChargeCodesGUI:
         self.use_phase_map.set(True)
         self.use_wbs_code_map.set(True)
         self.use_wbs_desc_map.set(True)
-        self.contract_options = ["1: FFP", "2: CRNF"]
+        self.contract_options = ["1: FFP", "2: FPI", "3: CPFF", "4: CPIF", "5: FPAF", "7: T&M", "8: CPAF"]
         self.contract_combo.configure(values=self.contract_options)
         if self.contract_options:
             self.contract_combo.set(self.contract_options[0])
